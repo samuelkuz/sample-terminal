@@ -1,6 +1,6 @@
 use std::env;
 use std::ffi::CString;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -83,5 +83,16 @@ impl TerminalSession {
 
     pub fn write_input(&self, bytes: &[u8]) {
         let _ = write(self.master_fd.as_fd(), bytes);
+    }
+
+    pub fn resize(&self, rows: u16, cols: u16, pixel_width: u16, pixel_height: u16) {
+        let winsize = Winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: pixel_width,
+            ws_ypixel: pixel_height,
+        };
+
+        let _ = unsafe { libc::ioctl(self.master_fd.as_raw_fd(), libc::TIOCSWINSZ, &winsize) };
     }
 }

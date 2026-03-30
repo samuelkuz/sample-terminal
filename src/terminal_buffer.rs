@@ -41,6 +41,7 @@ impl TerminalBuffer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn visible_lines(&self, max_lines: usize) -> Vec<String> {
         let start = self.lines.len().saturating_sub(max_lines);
         self.lines[start..]

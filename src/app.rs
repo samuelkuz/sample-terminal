@@ -1,28 +1,22 @@
+use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObject};
-use objc2::{ClassType, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+use objc2::runtime::NSObject;
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApp, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSEvent, NSFont,
-    NSFontAttributeName, NSForegroundColorAttributeName, NSRectFill, NSResponder, NSStringDrawing,
-    NSView, NSWindow, NSWindowStyleMask,
+    NSApp, NSApplicationActivationPolicy, NSBackingStoreType, NSEvent, NSResponder, NSView,
+    NSWindow, NSWindowStyleMask,
 };
-use objc2_foundation::{
-    NSDictionary, NSAttributedStringKey, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
-    NSTimer,
-};
+use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer};
 
+use crate::renderer::{RenderFrameInput, TerminalRenderer};
 use crate::session::TerminalSession;
 use crate::terminal_buffer::TerminalBuffer;
 
 const WINDOW_WIDTH: f64 = 900.0;
 const WINDOW_HEIGHT: f64 = 640.0;
-const FONT_SIZE: f64 = 14.0;
-const LINE_HEIGHT: f64 = 18.0;
-const H_PADDING: f64 = 12.0;
-const V_PADDING: f64 = 12.0;
 
 static APP_STATE: OnceLock<Arc<AppState>> = OnceLock::new();
 
@@ -40,7 +34,7 @@ pub fn run() -> Result<(), String> {
     let view = TerminalView::new(
         mtm,
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_WIDTH, WINDOW_HEIGHT)),
-    );
+    )?;
     window.setContentView(Some(&view));
     let responder: &NSResponder = &view;
     window.makeFirstResponder(Some(responder));
@@ -66,6 +60,8 @@ pub fn run() -> Result<(), String> {
 struct AppState {
     session: TerminalSession,
     buffer: Mutex<TerminalBuffer>,
+    activity_counter: Mutex<u64>,
+    last_winsize: Mutex<Option<(u16, u16, u16, u16)>>,
 }
 
 impl AppState {
@@ -73,6 +69,8 @@ impl AppState {
         Ok(Self {
             session: TerminalSession::spawn()?,
             buffer: Mutex::new(TerminalBuffer::new()),
+            activity_counter: Mutex::new(0),
+            last_winsize: Mutex::new(None),
         })
     }
 
@@ -80,6 +78,11 @@ impl AppState {
         let chunks = self.session.try_read();
         if chunks.is_empty() {
             return false;
+        }
+
+        let total_bytes = chunks.iter().map(|chunk| chunk.len() as u64).sum::<u64>();
+        if let Ok(mut counter) = self.activity_counter.lock() {
+            *counter = counter.saturating_add(total_bytes.max(1));
         }
 
         let Ok(mut buffer) = self.buffer.lock() else {
@@ -93,16 +96,43 @@ impl AppState {
         true
     }
 
-    fn visible_lines(&self, max_lines: usize) -> Vec<String> {
-        let Ok(buffer) = self.buffer.lock() else {
-            return Vec::new();
-        };
-
-        buffer.visible_lines(max_lines)
+    fn send_input(&self, bytes: &[u8]) {
+        if let Ok(mut counter) = self.activity_counter.lock() {
+            *counter = counter.saturating_add(bytes.len() as u64 + 1);
+        }
+        self.session.write_input(bytes);
     }
 
-    fn send_input(&self, bytes: &[u8]) {
-        self.session.write_input(bytes);
+    fn activity_counter(&self) -> u64 {
+        self.activity_counter.lock().map(|counter| *counter).unwrap_or(0)
+    }
+
+    fn sync_window_size(&self, cols: u16, rows: u16, pixel_width: u16, pixel_height: u16) {
+        let Ok(mut winsize) = self.last_winsize.lock() else {
+            return;
+        };
+
+        let next = (cols, rows, pixel_width, pixel_height);
+        if winsize.as_ref() == Some(&next) {
+            return;
+        }
+
+        self.session.resize(rows, cols, pixel_width, pixel_height);
+        *winsize = Some(next);
+    }
+}
+
+struct TerminalViewState {
+    renderer: Option<TerminalRenderer>,
+    startup_error: Option<String>,
+}
+
+impl TerminalViewState {
+    fn new() -> Self {
+        Self {
+            renderer: None,
+            startup_error: None,
+        }
     }
 }
 
@@ -139,7 +169,7 @@ fn app_state() -> Option<&'static Arc<AppState>> {
 define_class!(
     #[unsafe(super = NSView)]
     #[thread_kind = MainThreadOnly]
-    #[ivars = ()]
+    #[ivars = RefCell<TerminalViewState>]
     struct TerminalView;
 
     unsafe impl NSObjectProtocol for TerminalView {}
@@ -155,6 +185,25 @@ define_class!(
             true
         }
 
+        #[unsafe(method(wantsUpdateLayer))]
+        fn wants_update_layer(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(updateLayer))]
+        fn update_layer(&self) {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                render_view(self);
+            }));
+        }
+
+        #[unsafe(method(renderFrame))]
+        fn render_frame(&self) {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                render_view(self);
+            }));
+        }
+
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
             let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -162,19 +211,48 @@ define_class!(
             }));
         }
 
-        #[unsafe(method(drawRect:))]
-        fn draw_rect(&self, dirty_rect: NSRect) {
-            let _ = catch_unwind(AssertUnwindSafe(|| {
-                draw_rect_impl(self, dirty_rect);
-            }));
+        #[unsafe(method(viewDidChangeBackingProperties))]
+        fn view_did_change_backing_properties(&self) {
+            let _: () = unsafe { msg_send![super(self), viewDidChangeBackingProperties] };
+            render_view(self);
+        }
+
+        #[unsafe(method(setFrameSize:))]
+        fn set_frame_size(&self, new_size: NSSize) {
+            let _: () = unsafe { msg_send![super(self), setFrameSize: new_size] };
+            render_view(self);
         }
     }
 );
 
 impl TerminalView {
-    fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(());
-        unsafe { msg_send![super(this), initWithFrame: frame] }
+    fn new(mtm: MainThreadMarker, frame: NSRect) -> Result<Retained<Self>, String> {
+        let this = Self::alloc(mtm).set_ivars(RefCell::new(TerminalViewState::new()));
+        let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        view.finish_setup()?;
+        Ok(view)
+    }
+
+    fn finish_setup(&self) -> Result<(), String> {
+        self.setWantsLayer(true);
+
+        let renderer = TerminalRenderer::new()?;
+        self.setLayer(Some(renderer.layer()));
+
+        let device_name = renderer.device_name();
+        {
+            let mut state = self.ivars().borrow_mut();
+            state.renderer = Some(renderer);
+            state.startup_error = None;
+        }
+
+        render_view(self);
+        let title = NSString::from_str(&format!("Sample Terminal ({device_name})"));
+        if let Some(window) = self.window() {
+            window.setTitle(&title);
+        }
+
+        Ok(())
     }
 }
 
@@ -218,47 +296,47 @@ fn key_down_impl(event: &NSEvent) {
     }
 }
 
-fn draw_rect_impl(this: &TerminalView, dirty_rect: NSRect) {
-    unsafe {
-        let Some(state) = app_state() else {
-            return;
-        };
+fn render_view(view: &TerminalView) {
+    let Some(app_state) = app_state() else {
+        return;
+    };
 
-        let background = NSColor::colorWithCalibratedRed_green_blue_alpha(0.08, 0.09, 0.11, 1.0);
-        let foreground = NSColor::colorWithCalibratedRed_green_blue_alpha(0.91, 0.93, 0.95, 1.0);
-        background.setFill();
-        NSRectFill(dirty_rect);
-
-        let bounds = this.bounds();
-        let visible_line_count =
-            ((bounds.size.height - (V_PADDING * 2.0)) / LINE_HEIGHT).floor().max(1.0) as usize;
-        let lines = state.visible_lines(visible_line_count);
-
-        let font_name = NSString::from_str("Menlo");
-        let font = if let Some(font) = NSFont::fontWithName_size(&font_name, FONT_SIZE) {
-            font
-        } else {
-            NSFont::userFixedPitchFontOfSize(FONT_SIZE)
-                .unwrap_or_else(|| NSFont::systemFontOfSize(FONT_SIZE))
-        };
-
-        let keys = [NSFontAttributeName, NSForegroundColorAttributeName];
-        let values = [
-            Retained::as_ptr(&font).cast::<AnyObject>(),
-            Retained::as_ptr(&foreground).cast::<AnyObject>(),
-        ];
-        let attributes: Retained<NSDictionary<NSAttributedStringKey, AnyObject>> = msg_send![
-            NSDictionary::<NSAttributedStringKey, AnyObject>::class(),
-            dictionaryWithObjects: values.as_ptr(),
-            forKeys: keys.as_ptr(),
-            count: keys.len(),
-        ];
-
-        for (index, line) in lines.iter().enumerate() {
-            let point = NSPoint::new(H_PADDING, V_PADDING + (index as f64 * LINE_HEIGHT));
-            let ns_string = NSString::from_str(line);
-            ns_string.drawAtPoint_withAttributes(point, Some(&attributes));
+    let mut state = view.ivars().borrow_mut();
+    let Some(renderer) = state.renderer.as_mut() else {
+        if state.startup_error.is_none() {
+            state.startup_error = Some("Metal renderer was not initialized".to_string());
         }
+        return;
+    };
+
+    let bounds = view.bounds();
+    let backing = view.convertRectToBacking(bounds);
+    let scale_factor = view
+        .window()
+        .map(|window| window.backingScaleFactor())
+        .unwrap_or(1.0);
+    let (terminal_cols, terminal_rows) =
+        crate::renderer::terminal_grid_size(bounds.size.width, bounds.size.height);
+    app_state.sync_window_size(
+        terminal_cols,
+        terminal_rows,
+        backing.size.width.round().clamp(1.0, u16::MAX as f64) as u16,
+        backing.size.height.round().clamp(1.0, u16::MAX as f64) as u16,
+    );
+
+    let input = RenderFrameInput {
+        view_width: bounds.size.width,
+        view_height: bounds.size.height,
+        pixel_width: backing.size.width.max(1.0),
+        pixel_height: backing.size.height.max(1.0),
+        scale_factor,
+        terminal_cols,
+        terminal_rows,
+        pty_activity: app_state.activity_counter(),
+    };
+
+    if let Err(error) = renderer.render(input) {
+        eprintln!("render error: {error}");
     }
 }
 
@@ -267,13 +345,13 @@ fn tick_impl() {
         return;
     };
 
-    if state.poll_session() {
-        let mtm = MainThreadMarker::new().expect("tick runs on the main thread");
-        let app = NSApp(mtm);
-        if let Some(window) = app.keyWindow() {
-            if let Some(view) = window.contentView() {
-                view.setNeedsDisplay(true);
-            }
+    let did_receive_output = state.poll_session();
+    let mtm = MainThreadMarker::new().expect("tick runs on the main thread");
+    let app = NSApp(mtm);
+    if let Some(window) = app.keyWindow() {
+        if let Some(view) = window.contentView() {
+            let _ = did_receive_output;
+            let _: () = unsafe { msg_send![&*view, renderFrame] };
         }
     }
 }
