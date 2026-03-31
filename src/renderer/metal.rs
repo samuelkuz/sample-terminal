@@ -1,26 +1,21 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
+use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::msg_send;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice,
     MTLClearColor, MTLLibrary, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
     MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
-    MTLRenderPipelineState, MTLStoreAction, MTLViewport,
+    MTLRenderPipelineState, MTLResourceOptions, MTLStoreAction, MTLViewport,
 };
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
-const OUTER_PADDING_X: f64 = 26.0;
-const OUTER_PADDING_Y: f64 = 24.0;
-const HEADER_HEIGHT: f64 = 36.0;
-const GRID_PADDING_X: f64 = 18.0;
-const GRID_PADDING_Y: f64 = 18.0;
-const CELL_WIDTH: f64 = 16.0;
-const CELL_HEIGHT: f64 = 24.0;
-    
+use crate::renderer::atlas::GlyphAtlas;
+use crate::renderer::cells::{Quad, RenderState, build_scene_quads, layout_metrics};
+
 const SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -52,7 +47,6 @@ fragment float4 fragment_main(RasterizerData in [[stage_in]]) {
 #[derive(Clone, Copy, Debug)]
 struct Vertex {
     position: [f32; 4],
-    // padding: [f32; 2],
     color: [f32; 4],
 }
 
@@ -63,9 +57,6 @@ pub struct RenderFrameInput {
     pub pixel_width: f64,
     pub pixel_height: f64,
     pub scale_factor: f64,
-    pub terminal_cols: u16,
-    pub terminal_rows: u16,
-    pub pty_activity: u64,
 }
 
 pub struct TerminalRenderer {
@@ -73,6 +64,7 @@ pub struct TerminalRenderer {
     command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     layer: Retained<CAMetalLayer>,
+    _atlas: GlyphAtlas,
     drawable_width: f64,
     drawable_height: f64,
 }
@@ -124,6 +116,7 @@ impl TerminalRenderer {
             command_queue,
             pipeline_state,
             layer,
+            _atlas: GlyphAtlas,
             drawable_width: 0.0,
             drawable_height: 0.0,
         })
@@ -161,7 +154,7 @@ impl TerminalRenderer {
             .setDrawableSize(objc2_foundation::NSSize::new(drawable_width, drawable_height));
     }
 
-    pub fn render(&mut self, input: RenderFrameInput) -> Result<(), String> {
+    pub fn render(&mut self, input: RenderFrameInput, state: &RenderState) -> Result<(), String> {
         self.resize(
             input.view_width,
             input.view_height,
@@ -205,17 +198,23 @@ impl TerminalRenderer {
             zfar: 1.0,
         });
 
-        let vertices = build_scene_vertices(input);
+        let metrics = layout_metrics(input.view_width, input.view_height, state);
+        let quads = build_scene_quads(metrics, state);
+        let vertices = build_scene_vertices(metrics.view_width, metrics.view_height, &quads);
         let byte_len = vertices.len() * std::mem::size_of::<Vertex>();
         let bytes = NonNull::new(vertices.as_ptr().cast_mut().cast::<c_void>())
             .ok_or("failed to prepare Metal vertex bytes")?;
-
-        unsafe {
-            encoder.setVertexBytes_length_atIndex(
+        let vertex_buffer = unsafe {
+            self.device.newBufferWithBytes_length_options(
                 bytes,
                 byte_len,
-                0,
-            );
+                MTLResourceOptions::empty(),
+            )
+        }
+        .ok_or("failed to create Metal vertex buffer")?;
+
+        unsafe {
+            encoder.setVertexBuffer_offset_atIndex(Some(&*vertex_buffer), 0, 0);
             encoder.drawPrimitives_vertexStart_vertexCount(
                 MTLPrimitiveType::Triangle,
                 0,
@@ -234,161 +233,20 @@ impl TerminalRenderer {
     }
 }
 
-pub fn terminal_grid_size(view_width: f64, view_height: f64) -> (u16, u16) {
-    let inner_width = (view_width - (OUTER_PADDING_X * 2.0) - (GRID_PADDING_X * 2.0)).max(CELL_WIDTH);
-    let inner_height = (view_height
-        - (OUTER_PADDING_Y * 2.0)
-        - HEADER_HEIGHT
-        - (GRID_PADDING_Y * 2.0))
-        .max(CELL_HEIGHT);
-
-    let cols = (inner_width / CELL_WIDTH).floor().max(8.0) as u16;
-    let rows = (inner_height / CELL_HEIGHT).floor().max(6.0) as u16;
-    (cols, rows)
-}
-
-fn build_scene_vertices(input: RenderFrameInput) -> Vec<Vertex> {
-    let mut vertices = Vec::new();
-    let width = input.view_width.max(1.0) as f32;
-    let height = input.view_height.max(1.0) as f32;
-    let padding_x = OUTER_PADDING_X as f32;
-    let padding_y = OUTER_PADDING_Y as f32;
-    let header_height = HEADER_HEIGHT as f32;
-    let grid_padding_x = GRID_PADDING_X as f32;
-    let grid_padding_y = GRID_PADDING_Y as f32;
-    let cell_width = CELL_WIDTH as f32;
-    let cell_height = CELL_HEIGHT as f32;
-    let terminal_x = padding_x;
-    let terminal_y = padding_y;
-    let terminal_width = (width - (padding_x * 2.0)).max(180.0);
-    let terminal_height = (height - (padding_y * 2.0)).max(160.0);
-    let content_x = terminal_x + grid_padding_x;
-    let content_y = terminal_y + header_height + grid_padding_y;
-    let content_width = (input.terminal_cols as f32) * cell_width;
-    let content_height = (input.terminal_rows as f32) * cell_height;
-    let activity_phase = (input.pty_activity % 24) as usize;
-
-    push_rect(
-        &mut vertices,
-        terminal_x,
-        terminal_y,
-        terminal_width,
-        terminal_height,
-        width,
-        height,
-        [0.08, 0.09, 0.12, 1.0],
-    );
-
-    push_rect(
-        &mut vertices,
-        terminal_x - 1.0,
-        terminal_y - 1.0,
-        terminal_width + 2.0,
-        terminal_height + 2.0,
-        width,
-        height,
-        [0.16, 0.18, 0.23, 1.0],
-    );
-
-    push_rect(
-        &mut vertices,
-        terminal_x,
-        terminal_y,
-        terminal_width,
-        header_height,
-        width,
-        height,
-        [0.12, 0.14, 0.19, 1.0],
-    );
-
-    push_rect(
-        &mut vertices,
-        content_x,
-        content_y,
-        content_width,
-        content_height,
-        width,
-        height,
-        [0.05, 0.07, 0.10, 1.0],
-    );
-
-    let demo_cols = input.terminal_cols.min(6) as usize;
-    let demo_rows = input.terminal_rows.min(4) as usize;
-    let tile_width = (cell_width - 4.0).max(6.0);
-    let tile_height = (cell_height - 4.0).max(8.0);
-
-    for row in 0..demo_rows {
-        for col in 0..demo_cols {
-            let palette_index = (row * demo_cols + col + activity_phase) % 6;
-            let color = match palette_index {
-                0 => [0.29, 0.58, 0.78, 1.0],
-                1 => [0.34, 0.74, 0.50, 1.0],
-                2 => [0.92, 0.68, 0.26, 1.0],
-                3 => [0.56, 0.66, 0.82, 1.0],
-                4 => [0.72, 0.56, 0.82, 1.0],
-                _ => [0.88, 0.44, 0.37, 1.0],
-            };
-            let tile_x = content_x + (col as f32 * cell_width) + 2.0;
-            let tile_y = content_y + (row as f32 * cell_height) + 2.0;
-
-            push_rect(
-                &mut vertices,
-                tile_x,
-                tile_y,
-                tile_width,
-                tile_height,
-                width,
-                height,
-                [0.13, 0.16, 0.20, 1.0],
-            );
-            push_rect(
-                &mut vertices,
-                tile_x + 1.0,
-                tile_y + 1.0,
-                tile_width - 2.0,
-                tile_height - 2.0,
-                width,
-                height,
-                color,
-            );
-        }
+fn build_scene_vertices(view_width: f32, view_height: f32, quads: &[Quad]) -> Vec<Vertex> {
+    let mut vertices = Vec::with_capacity(quads.len() * 6);
+    for quad in quads {
+        push_rect(
+            &mut vertices,
+            quad.x,
+            quad.y,
+            quad.width,
+            quad.height,
+            view_width,
+            view_height,
+            quad.color.0,
+        );
     }
-
-    let cursor_col = activity_phase % demo_cols.max(1);
-    let cursor_row = (activity_phase / demo_cols.max(1)) % demo_rows.max(1);
-    push_rect(
-        &mut vertices,
-        content_x + (cursor_col as f32 * cell_width) + 1.0,
-        content_y + (cursor_row as f32 * cell_height) + 1.0,
-        cell_width - 2.0,
-        cell_height - 2.0,
-        width,
-        height,
-        [0.95, 0.96, 0.98, 0.18],
-    );
-
-    let indicator_width = (demo_cols as f32 * cell_width).max(48.0);
-    push_rect(
-        &mut vertices,
-        content_x,
-        content_y + (demo_rows as f32 * cell_height) + 12.0,
-        indicator_width,
-        6.0,
-        width,
-        height,
-        [0.16, 0.20, 0.25, 1.0],
-    );
-    push_rect(
-        &mut vertices,
-        content_x,
-        content_y + (demo_rows as f32 * cell_height) + 12.0,
-        indicator_width * (((activity_phase % 12) as f32 + 1.0) / 12.0),
-        6.0,
-        width,
-        height,
-        [0.34, 0.74, 0.50, 1.0],
-    );
-
     vertices
 }
 
@@ -410,32 +268,26 @@ fn push_rect(
     vertices.extend_from_slice(&[
         Vertex {
             position: [left, top, 0.0, 1.0],
-            // padding: [0.0, 0.0],
             color,
         },
         Vertex {
             position: [right, top, 0.0, 1.0],
-            // padding: [0.0, 0.0],
             color,
         },
         Vertex {
             position: [left, bottom, 0.0, 1.0],
-            // padding: [0.0, 0.0],
             color,
         },
         Vertex {
             position: [right, top, 0.0, 1.0],
-            // padding: [0.0, 0.0],
             color,
         },
         Vertex {
             position: [right, bottom, 0.0, 1.0],
-            // padding: [0.0, 0.0],
             color,
         },
         Vertex {
             position: [left, bottom, 0.0, 1.0],
-            // padding: [0.0, 0.0],
             color,
         },
     ]);

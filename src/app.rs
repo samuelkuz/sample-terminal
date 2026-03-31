@@ -11,7 +11,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer};
 
-use crate::renderer::{RenderFrameInput, TerminalRenderer};
+use crate::renderer::{RenderFrameInput, TerminalRenderer, terminal_grid_size};
 use crate::session::TerminalSession;
 use crate::terminal_buffer::TerminalBuffer;
 
@@ -66,9 +66,10 @@ struct AppState {
 
 impl AppState {
     fn new() -> Result<Self, String> {
+        let (cols, rows) = terminal_grid_size(WINDOW_WIDTH, WINDOW_HEIGHT);
         Ok(Self {
             session: TerminalSession::spawn()?,
-            buffer: Mutex::new(TerminalBuffer::new()),
+            buffer: Mutex::new(TerminalBuffer::new(cols, rows)),
             activity_counter: Mutex::new(0),
             last_winsize: Mutex::new(None),
         })
@@ -101,10 +102,6 @@ impl AppState {
             *counter = counter.saturating_add(bytes.len() as u64 + 1);
         }
         self.session.write_input(bytes);
-    }
-
-    fn activity_counter(&self) -> u64 {
-        self.activity_counter.lock().map(|counter| *counter).unwrap_or(0)
     }
 
     fn sync_window_size(&self, cols: u16, rows: u16, pixel_width: u16, pixel_height: u16) {
@@ -240,10 +237,11 @@ impl TerminalView {
         self.setLayer(Some(renderer.layer()));
 
         let device_name = renderer.device_name();
-        {
-            let mut state = self.ivars().borrow_mut();
+        if let Ok(mut state) = self.ivars().try_borrow_mut() {
             state.renderer = Some(renderer);
             state.startup_error = None;
+        } else {
+            return Err("terminal view state is already borrowed during setup".to_string());
         }
 
         render_view(self);
@@ -301,7 +299,9 @@ fn render_view(view: &TerminalView) {
         return;
     };
 
-    let mut state = view.ivars().borrow_mut();
+    let Ok(mut state) = view.ivars().try_borrow_mut() else {
+        return;
+    };
     let Some(renderer) = state.renderer.as_mut() else {
         if state.startup_error.is_none() {
             state.startup_error = Some("Metal renderer was not initialized".to_string());
@@ -315,8 +315,7 @@ fn render_view(view: &TerminalView) {
         .window()
         .map(|window| window.backingScaleFactor())
         .unwrap_or(1.0);
-    let (terminal_cols, terminal_rows) =
-        crate::renderer::terminal_grid_size(bounds.size.width, bounds.size.height);
+    let (terminal_cols, terminal_rows) = terminal_grid_size(bounds.size.width, bounds.size.height);
     app_state.sync_window_size(
         terminal_cols,
         terminal_rows,
@@ -324,18 +323,24 @@ fn render_view(view: &TerminalView) {
         backing.size.height.round().clamp(1.0, u16::MAX as f64) as u16,
     );
 
+    let render_state = app_state
+        .buffer
+        .lock()
+        .map(|mut buffer| {
+            buffer.resize(terminal_cols, terminal_rows);
+            buffer.render_state()
+        })
+        .unwrap_or_else(|_| crate::renderer::RenderState::new(terminal_cols, terminal_rows));
+
     let input = RenderFrameInput {
         view_width: bounds.size.width,
         view_height: bounds.size.height,
         pixel_width: backing.size.width.max(1.0),
         pixel_height: backing.size.height.max(1.0),
         scale_factor,
-        terminal_cols,
-        terminal_rows,
-        pty_activity: app_state.activity_counter(),
     };
 
-    if let Err(error) = renderer.render(input) {
+    if let Err(error) = renderer.render(input, &render_state) {
         eprintln!("render error: {error}");
     }
 }
