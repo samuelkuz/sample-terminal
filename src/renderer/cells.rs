@@ -1,10 +1,12 @@
+use crate::renderer::atlas::GlyphAtlas;
+
 const OUTER_PADDING_X: f64 = 26.0;
 const OUTER_PADDING_Y: f64 = 24.0;
 const HEADER_HEIGHT: f64 = 36.0;
 const GRID_PADDING_X: f64 = 18.0;
 const GRID_PADDING_Y: f64 = 18.0;
-const CELL_WIDTH: f64 = 16.0;
-const CELL_HEIGHT: f64 = 24.0;
+pub(crate) const CELL_WIDTH: f64 = 16.0;
+pub(crate) const CELL_HEIGHT: f64 = 24.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Color(pub(crate) [f32; 4]);
@@ -136,6 +138,23 @@ pub(crate) struct Quad {
     pub(crate) color: Color,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TextInstance {
+    pub(crate) origin: [f32; 2],
+    pub(crate) size: [f32; 2],
+    pub(crate) uv_origin: [f32; 2],
+    pub(crate) uv_size: [f32; 2],
+    pub(crate) color: [f32; 4],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SceneGeometry {
+    pub(crate) background_quads: Vec<Quad>,
+    pub(crate) text_instances: Vec<TextInstance>,
+    pub(crate) overlay_quads: Vec<Quad>,
+}
+
 pub fn terminal_grid_size(view_width: f64, view_height: f64) -> (u16, u16) {
     let inner_width =
         (view_width - (OUTER_PADDING_X * 2.0) - (GRID_PADDING_X * 2.0)).max(CELL_WIDTH);
@@ -184,33 +203,39 @@ pub(crate) fn layout_metrics(view_width: f64, view_height: f64, state: &RenderSt
     }
 }
 
-pub(crate) fn build_scene_quads(metrics: LayoutMetrics, state: &RenderState) -> Vec<Quad> {
-    let mut quads = Vec::new();
+pub(crate) fn build_scene_geometry(
+    metrics: LayoutMetrics,
+    state: &RenderState,
+    atlas: &GlyphAtlas,
+) -> SceneGeometry {
+    let mut background_quads = Vec::new();
+    let mut text_instances = Vec::new();
+    let mut overlay_quads = Vec::new();
     let tile_width = (metrics.cell_width - 4.0).max(6.0);
     let tile_height = (metrics.cell_height - 4.0).max(8.0);
 
-    quads.push(Quad {
+    background_quads.push(Quad {
         x: metrics.terminal_x,
         y: metrics.terminal_y,
         width: metrics.terminal_width,
         height: metrics.terminal_height,
         color: CHROME_BACKGROUND,
     });
-    quads.push(Quad {
+    background_quads.push(Quad {
         x: metrics.terminal_x - 1.0,
         y: metrics.terminal_y - 1.0,
         width: metrics.terminal_width + 2.0,
         height: metrics.terminal_height + 2.0,
         color: CHROME_BORDER,
     });
-    quads.push(Quad {
+    background_quads.push(Quad {
         x: metrics.terminal_x,
         y: metrics.terminal_y,
         width: metrics.terminal_width,
         height: metrics.header_height,
         color: CHROME_HEADER,
     });
-    quads.push(Quad {
+    background_quads.push(Quad {
         x: metrics.content_x,
         y: metrics.content_y,
         width: metrics.content_width,
@@ -224,7 +249,7 @@ pub(crate) fn build_scene_quads(metrics: LayoutMetrics, state: &RenderState) -> 
             let x = metrics.content_x + (col as f32 * metrics.cell_width) + 2.0;
             let y = metrics.content_y + (row as f32 * metrics.cell_height) + 2.0;
 
-            quads.push(Quad {
+            background_quads.push(Quad {
                 x,
                 y,
                 width: tile_width,
@@ -233,13 +258,19 @@ pub(crate) fn build_scene_quads(metrics: LayoutMetrics, state: &RenderState) -> 
             });
 
             if cell.ch != ' ' {
-                quads.push(Quad {
-                    x: x + 1.0,
-                    y: y + 1.0,
-                    width: tile_width - 2.0,
-                    height: tile_height - 2.0,
-                    color: demo_color_for_char(cell.ch),
-                });
+                let glyph = atlas.glyph_for(cell.ch);
+                if glyph.bitmap_size[0] > 0.0 && glyph.bitmap_size[1] > 0.0 {
+                    text_instances.push(TextInstance {
+                        origin: [
+                            metrics.content_x + (col as f32 * metrics.cell_width) + glyph.offset[0],
+                            metrics.content_y + (row as f32 * metrics.cell_height) + glyph.offset[1],
+                        ],
+                        size: glyph.bitmap_size,
+                        uv_origin: glyph.uv_origin,
+                        uv_size: glyph.uv_size,
+                        color: cell.fg,
+                    });
+                }
             }
         }
     }
@@ -247,7 +278,7 @@ pub(crate) fn build_scene_quads(metrics: LayoutMetrics, state: &RenderState) -> 
     if let Some(cursor) = state.cursor.filter(|cursor| cursor.visible) {
         let cursor_col = cursor.col.min(state.cols.saturating_sub(1));
         let cursor_row = cursor.row.min(state.rows.saturating_sub(1));
-        quads.push(Quad {
+        overlay_quads.push(Quad {
             x: metrics.content_x + (cursor_col as f32 * metrics.cell_width) + 1.0,
             y: metrics.content_y + (cursor_row as f32 * metrics.cell_height) + 1.0,
             width: metrics.cell_width - 2.0,
@@ -256,23 +287,25 @@ pub(crate) fn build_scene_quads(metrics: LayoutMetrics, state: &RenderState) -> 
         });
     }
 
-    quads
-}
-
-fn demo_color_for_char(ch: char) -> Color {
-    match ch as usize % 6 {
-        0 => Color::rgba(0.29, 0.58, 0.78, 1.0),
-        1 => Color::rgba(0.34, 0.74, 0.50, 1.0),
-        2 => Color::rgba(0.92, 0.68, 0.26, 1.0),
-        3 => Color::rgba(0.56, 0.66, 0.82, 1.0),
-        4 => Color::rgba(0.72, 0.56, 0.82, 1.0),
-        _ => Color::rgba(0.88, 0.44, 0.37, 1.0),
+    SceneGeometry {
+        background_quads,
+        text_instances,
+        overlay_quads,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CursorState, RenderState, build_scene_quads, layout_metrics, terminal_grid_size};
+    use objc2_metal::MTLCreateSystemDefaultDevice;
+
+    use crate::renderer::atlas::GlyphAtlas;
+
+    use super::{CursorState, RenderState, build_scene_geometry, layout_metrics, terminal_grid_size};
+
+    fn atlas() -> GlyphAtlas {
+        let device = MTLCreateSystemDefaultDevice().expect("default metal device");
+        GlyphAtlas::new(&device).expect("glyph atlas")
+    }
 
     #[test]
     fn grid_size_has_minimums() {
@@ -288,13 +321,15 @@ mod tests {
     fn empty_scene_contains_only_frame_and_cell_backgrounds() {
         let state = RenderState::new(2, 2);
         let metrics = layout_metrics(300.0, 240.0, &state);
-        let quads = build_scene_quads(metrics, &state);
+        let scene = build_scene_geometry(metrics, &state, &atlas());
 
-        assert_eq!(quads.len(), 8);
+        assert_eq!(scene.background_quads.len(), 8);
+        assert!(scene.text_instances.is_empty());
+        assert!(scene.overlay_quads.is_empty());
     }
 
     #[test]
-    fn non_empty_cells_and_cursor_add_visible_quads() {
+    fn non_empty_cells_and_cursor_add_visible_instances() {
         let mut state = RenderState::new(2, 2);
         state.set_char(0, 0, 'A');
         state.set_char(1, 1, 'B');
@@ -305,8 +340,14 @@ mod tests {
         }));
 
         let metrics = layout_metrics(300.0, 240.0, &state);
-        let quads = build_scene_quads(metrics, &state);
+        let scene = build_scene_geometry(metrics, &state, &atlas());
 
-        assert_eq!(quads.len(), 11);
+        assert_eq!(scene.background_quads.len(), 8);
+        assert_eq!(scene.text_instances.len(), 2);
+        assert_eq!(scene.overlay_quads.len(), 1);
+        assert!(scene.text_instances[0].size[0] > 0.0);
+        assert!(scene.text_instances[0].size[1] > 0.0);
+        assert!(scene.text_instances[0].origin[0] >= metrics.content_x);
+        assert!(scene.text_instances[0].origin[1] >= metrics.content_y - 4.0);
     }
 }
