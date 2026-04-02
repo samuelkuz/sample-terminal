@@ -6,17 +6,19 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBlendFactor, MTLBlendOperation, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLClearColor, MTLLibrary, MTLLoadAction,
+    MTLBlendFactor, MTLBlendOperation, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
+    MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLLoadAction,
     MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
     MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLResourceOptions, MTLSamplerAddressMode,
     MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerState, MTLStoreAction, MTLViewport,
 };
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
+use crate::layout::{LayoutMetrics, layout_metrics};
 use crate::renderer::atlas::GlyphAtlas;
 use crate::renderer::cells::{
-    Quad, RenderState, TextInstance, build_scene_geometry, layout_metrics,
+    Quad, RenderSnapshot, RowGeometry, SelectionRange, TextInstance, build_chrome_quads,
+    build_cursor_quad, build_row_geometry,
 };
 
 const SHADER_SOURCE: &str = r#"
@@ -113,18 +115,20 @@ struct TextUniforms {
     view_size: [f32; 2],
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct RenderFrameInput {
     pub view_width: f64,
     pub view_height: f64,
     pub pixel_width: f64,
     pub pixel_height: f64,
     pub scale_factor: f64,
+    pub cursor_visible: bool,
+    pub selection: Option<SelectionRange>,
 }
 
 pub struct TerminalRenderer {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
-    command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    command_queue: Retained<ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
     solid_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     text_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     text_sampler: Retained<ProtocolObject<dyn MTLSamplerState>>,
@@ -132,6 +136,11 @@ pub struct TerminalRenderer {
     atlas: GlyphAtlas,
     drawable_width: f64,
     drawable_height: f64,
+    chrome_quads: Vec<Quad>,
+    row_caches: Vec<RowGeometry>,
+    cached_cols: u16,
+    cached_rows: u16,
+    last_selection: Option<SelectionRange>,
 }
 
 impl TerminalRenderer {
@@ -171,6 +180,11 @@ impl TerminalRenderer {
             atlas,
             drawable_width: 0.0,
             drawable_height: 0.0,
+            chrome_quads: Vec::new(),
+            row_caches: Vec::new(),
+            cached_cols: 0,
+            cached_rows: 0,
+            last_selection: None,
         })
     }
 
@@ -194,19 +208,23 @@ impl TerminalRenderer {
         ));
         self.layer.setContentsScale(scale_factor.max(1.0));
 
-        if (self.drawable_width - drawable_width).abs() < f64::EPSILON
-            && (self.drawable_height - drawable_height).abs() < f64::EPSILON
+        if (self.drawable_width - drawable_width).abs() >= f64::EPSILON
+            || (self.drawable_height - drawable_height).abs() >= f64::EPSILON
         {
-            return;
+            self.drawable_width = drawable_width;
+            self.drawable_height = drawable_height;
+            self.layer.setDrawableSize(objc2_foundation::NSSize::new(
+                drawable_width,
+                drawable_height,
+            ));
         }
-
-        self.drawable_width = drawable_width;
-        self.drawable_height = drawable_height;
-        self.layer
-            .setDrawableSize(objc2_foundation::NSSize::new(drawable_width, drawable_height));
     }
 
-    pub fn render(&mut self, input: RenderFrameInput, state: &RenderState) -> Result<(), String> {
+    pub fn render(
+        &mut self,
+        input: RenderFrameInput,
+        snapshot: &RenderSnapshot,
+    ) -> Result<(), String> {
         self.resize(
             input.view_width,
             input.view_height,
@@ -249,8 +267,27 @@ impl TerminalRenderer {
             zfar: 1.0,
         });
 
-        let metrics = layout_metrics(input.view_width, input.view_height, state);
-        let scene = build_scene_geometry(metrics, state, &self.atlas);
+        let metrics = layout_metrics(
+            input.view_width,
+            input.view_height,
+            snapshot.cols,
+            snapshot.rows,
+        );
+        self.update_caches(metrics, snapshot, input.selection);
+
+        let mut background_quads = self.chrome_quads.clone();
+        let mut selection_quads = Vec::new();
+        let mut text_instances = Vec::new();
+        for row_cache in &self.row_caches {
+            background_quads.extend_from_slice(&row_cache.background_quads);
+            selection_quads.extend_from_slice(&row_cache.overlay_quads);
+            text_instances.extend_from_slice(&row_cache.text_instances);
+        }
+
+        let mut overlay_quads = selection_quads;
+        if let Some(cursor_quad) = build_cursor_quad(metrics, snapshot, input.cursor_visible) {
+            overlay_quads.push(cursor_quad);
+        }
 
         draw_solid_pass(
             &self.device,
@@ -258,9 +295,8 @@ impl TerminalRenderer {
             &self.solid_pipeline_state,
             metrics.view_width,
             metrics.view_height,
-            &scene.background_quads,
+            &background_quads,
         )?;
-
         draw_text_pass(
             &self.device,
             &*encoder,
@@ -269,27 +305,64 @@ impl TerminalRenderer {
             &self.atlas,
             metrics.view_width,
             metrics.view_height,
-            &scene.text_instances,
+            &text_instances,
         )?;
-
         draw_solid_pass(
             &self.device,
             &*encoder,
             &self.solid_pipeline_state,
             metrics.view_width,
             metrics.view_height,
-            &scene.overlay_quads,
+            &overlay_quads,
         )?;
 
         encoder.endEncoding();
         let _: () = unsafe { msg_send![&*command_buffer, presentDrawable: &*drawable] };
         command_buffer.commit();
-
         Ok(())
     }
 
     pub fn device_name(&self) -> String {
         self.device.name().to_string()
+    }
+
+    fn update_caches(
+        &mut self,
+        metrics: LayoutMetrics,
+        snapshot: &RenderSnapshot,
+        selection: Option<SelectionRange>,
+    ) {
+        let dims_changed = self.cached_cols != snapshot.cols || self.cached_rows != snapshot.rows;
+        if dims_changed
+            || snapshot.damage.full_rebuild
+            || self.row_caches.len() != snapshot.rows as usize
+        {
+            self.chrome_quads = build_chrome_quads(metrics);
+            self.row_caches = (0..snapshot.rows)
+                .map(|row| build_row_geometry(metrics, snapshot, &self.atlas, row, selection))
+                .collect();
+        } else {
+            if selection != self.last_selection || snapshot.damage.selection_dirty {
+                for row in 0..snapshot.rows {
+                    self.row_caches[row as usize] =
+                        build_row_geometry(metrics, snapshot, &self.atlas, row, selection);
+                }
+            } else {
+                for &row in &snapshot.damage.dirty_rows {
+                    if row < snapshot.rows {
+                        self.row_caches[row as usize] =
+                            build_row_geometry(metrics, snapshot, &self.atlas, row, selection);
+                    }
+                }
+            }
+            if snapshot.damage.global_dirty {
+                self.chrome_quads = build_chrome_quads(metrics);
+            }
+        }
+
+        self.cached_cols = snapshot.cols;
+        self.cached_rows = snapshot.rows;
+        self.last_selection = selection;
     }
 }
 
@@ -376,7 +449,6 @@ fn draw_solid_pass(
     if quads.is_empty() {
         return Ok(());
     }
-
     let vertices = build_scene_vertices(view_width, view_height, quads);
     let vertex_buffer = make_buffer(device, &vertices)?;
     encoder.setRenderPipelineState(pipeline_state);
@@ -437,8 +509,10 @@ fn make_buffer<T>(
     let byte_len = std::mem::size_of_val(data);
     let bytes = NonNull::new(data.as_ptr().cast_mut().cast::<c_void>())
         .ok_or("failed to prepare Metal buffer bytes")?;
-    unsafe { device.newBufferWithBytes_length_options(bytes, byte_len, MTLResourceOptions::empty()) }
-        .ok_or("failed to create Metal buffer".to_string())
+    unsafe {
+        device.newBufferWithBytes_length_options(bytes, byte_len, MTLResourceOptions::empty())
+    }
+    .ok_or("failed to create Metal buffer".to_string())
 }
 
 fn build_scene_vertices(view_width: f32, view_height: f32, quads: &[Quad]) -> Vec<SolidVertex> {

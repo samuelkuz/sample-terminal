@@ -6,12 +6,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use nix::pty::{ForkptyResult, Winsize, forkpty};
-use nix::unistd::{Pid, execvp, read, write};
+use nix::sys::wait::waitpid;
+use nix::unistd::{execvp, read, write};
 
 pub struct TerminalSession {
     master_fd: Arc<OwnedFd>,
     receiver: Mutex<Receiver<Vec<u8>>>,
-    _child_pid: Pid,
 }
 
 impl TerminalSession {
@@ -59,10 +59,13 @@ impl TerminalSession {
                     }
                 });
 
+                thread::spawn(move || {
+                    let _ = waitpid(child, None);
+                });
+
                 Ok(Self {
                     master_fd,
                     receiver: Mutex::new(receiver),
-                    _child_pid: child,
                 })
             }
         }

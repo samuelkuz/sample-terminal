@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use objc2::rc::Retained;
 use objc2::runtime::NSObject;
@@ -11,9 +11,10 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer};
 
-use crate::renderer::{RenderFrameInput, TerminalRenderer, terminal_grid_size};
-use crate::session::TerminalSession;
-use crate::terminal_buffer::TerminalBuffer;
+use crate::app_state::AppState;
+use crate::input::{SelectionPhase, normalized_scroll_lines, terminal_input_bytes};
+use crate::layout::{point_to_cell, terminal_grid_size};
+use crate::renderer::{RenderFrameInput, TerminalRenderer};
 
 const WINDOW_WIDTH: f64 = 900.0;
 const WINDOW_HEIGHT: f64 = 640.0;
@@ -22,7 +23,8 @@ static APP_STATE: OnceLock<Arc<AppState>> = OnceLock::new();
 
 pub fn run() -> Result<(), String> {
     let mtm = MainThreadMarker::new().ok_or("failed to acquire main thread marker")?;
-    let state = Arc::new(AppState::new()?);
+    let (cols, rows) = terminal_grid_size(WINDOW_WIDTH, WINDOW_HEIGHT);
+    let state = Arc::new(AppState::new(cols, rows)?);
     APP_STATE
         .set(Arc::clone(&state))
         .map_err(|_| "application state already initialized".to_string())?;
@@ -33,7 +35,10 @@ pub fn run() -> Result<(), String> {
     let window = create_window(mtm);
     let view = TerminalView::new(
         mtm,
-        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_WIDTH, WINDOW_HEIGHT)),
+        NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
+        ),
     )?;
     window.setContentView(Some(&view));
     let responder: &NSResponder = &view;
@@ -55,68 +60,6 @@ pub fn run() -> Result<(), String> {
     }
 
     Ok(())
-}
-
-struct AppState {
-    session: TerminalSession,
-    buffer: Mutex<TerminalBuffer>,
-    activity_counter: Mutex<u64>,
-    last_winsize: Mutex<Option<(u16, u16, u16, u16)>>,
-}
-
-impl AppState {
-    fn new() -> Result<Self, String> {
-        let (cols, rows) = terminal_grid_size(WINDOW_WIDTH, WINDOW_HEIGHT);
-        Ok(Self {
-            session: TerminalSession::spawn()?,
-            buffer: Mutex::new(TerminalBuffer::new(cols, rows)),
-            activity_counter: Mutex::new(0),
-            last_winsize: Mutex::new(None),
-        })
-    }
-
-    fn poll_session(&self) -> bool {
-        let chunks = self.session.try_read();
-        if chunks.is_empty() {
-            return false;
-        }
-
-        let total_bytes = chunks.iter().map(|chunk| chunk.len() as u64).sum::<u64>();
-        if let Ok(mut counter) = self.activity_counter.lock() {
-            *counter = counter.saturating_add(total_bytes.max(1));
-        }
-
-        let Ok(mut buffer) = self.buffer.lock() else {
-            return false;
-        };
-
-        for chunk in chunks {
-            buffer.push_bytes(&chunk);
-        }
-
-        true
-    }
-
-    fn send_input(&self, bytes: &[u8]) {
-        if let Ok(mut counter) = self.activity_counter.lock() {
-            *counter = counter.saturating_add(bytes.len() as u64 + 1);
-        }
-        self.session.write_input(bytes);
-    }
-
-    fn sync_window_size(&self, cols: u16, rows: u16, pixel_width: u16, pixel_height: u16) {
-        let Ok(mut winsize) = self.last_winsize.lock() else {
-            return;
-        };
-
-        let next = (cols, rows, pixel_width, pixel_height);
-        if winsize.as_ref() == Some(&next) {
-            return;
-        }
-
-        self.session.resize(rows, cols, pixel_width, pixel_height);
-        *winsize = Some(next);
-    }
 }
 
 struct TerminalViewState {
@@ -208,6 +151,34 @@ define_class!(
             }));
         }
 
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                selection_event(self, event, SelectionPhase::Start);
+            }));
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                selection_event(self, event, SelectionPhase::Update);
+            }));
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, event: &NSEvent) {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                selection_event(self, event, SelectionPhase::End);
+            }));
+        }
+
+        #[unsafe(method(scrollWheel:))]
+        fn scroll_wheel(&self, event: &NSEvent) {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                scroll_event(self, event);
+            }));
+        }
+
         #[unsafe(method(viewDidChangeBackingProperties))]
         fn view_did_change_backing_properties(&self) {
             let _: () = unsafe { msg_send![super(self), viewDidChangeBackingProperties] };
@@ -289,9 +260,46 @@ fn key_down_impl(event: &NSEvent) {
     };
 
     let text = characters.to_string();
-    if !text.is_empty() {
-        state.send_input(text.as_bytes());
+    if let Some(sequence) = terminal_input_bytes(&text) {
+        state.send_input(&sequence);
     }
+}
+
+fn selection_event(view: &TerminalView, event: &NSEvent, phase: SelectionPhase) {
+    let Some(app_state) = app_state() else {
+        return;
+    };
+
+    let bounds = view.bounds();
+    let (cols, rows) = terminal_grid_size(bounds.size.width, bounds.size.height);
+    let point = view.convertPoint_fromView(event.locationInWindow(), None);
+    let cell = point_to_cell(
+        bounds.size.width,
+        bounds.size.height,
+        cols,
+        rows,
+        point.x,
+        point.y,
+    );
+
+    app_state.update_selection(phase, cell);
+    render_view(view);
+}
+
+fn scroll_event(view: &TerminalView, event: &NSEvent) {
+    let Some(app_state) = app_state() else {
+        return;
+    };
+
+    let lines = normalized_scroll_lines(event.scrollingDeltaY(), event.hasPreciseScrollingDeltas());
+    if lines == 0 {
+        return;
+    }
+
+    app_state.scroll_viewport(lines);
+    app_state.stop_selection_drag();
+
+    render_view(view);
 }
 
 fn render_view(view: &TerminalView) {
@@ -323,14 +331,9 @@ fn render_view(view: &TerminalView) {
         backing.size.height.round().clamp(1.0, u16::MAX as f64) as u16,
     );
 
-    let render_state = app_state
-        .buffer
-        .lock()
-        .map(|mut buffer| {
-            buffer.resize(terminal_cols, terminal_rows);
-            buffer.render_state()
-        })
-        .unwrap_or_else(|_| crate::renderer::RenderState::new(terminal_cols, terminal_rows));
+    let cursor_visible = app_state.cursor_visible();
+    let selection = app_state.selection_range();
+    let render_state = app_state.render_snapshot(terminal_cols, terminal_rows, cursor_visible);
 
     let input = RenderFrameInput {
         view_width: bounds.size.width,
@@ -338,6 +341,8 @@ fn render_view(view: &TerminalView) {
         pixel_width: backing.size.width.max(1.0),
         pixel_height: backing.size.height.max(1.0),
         scale_factor,
+        cursor_visible,
+        selection,
     };
 
     if let Err(error) = renderer.render(input, &render_state) {
@@ -350,12 +355,15 @@ fn tick_impl() {
         return;
     };
 
-    let did_receive_output = state.poll_session();
+    let should_render = state.poll_session_and_should_render();
+    if !should_render {
+        return;
+    }
+
     let mtm = MainThreadMarker::new().expect("tick runs on the main thread");
     let app = NSApp(mtm);
     if let Some(window) = app.keyWindow() {
         if let Some(view) = window.contentView() {
-            let _ = did_receive_output;
             let _: () = unsafe { msg_send![&*view, renderFrame] };
         }
     }

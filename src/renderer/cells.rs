@@ -1,12 +1,7 @@
-use crate::renderer::atlas::GlyphAtlas;
+use std::collections::BTreeSet;
 
-const OUTER_PADDING_X: f64 = 26.0;
-const OUTER_PADDING_Y: f64 = 24.0;
-const HEADER_HEIGHT: f64 = 36.0;
-const GRID_PADDING_X: f64 = 18.0;
-const GRID_PADDING_Y: f64 = 18.0;
-pub(crate) const CELL_WIDTH: f64 = 16.0;
-pub(crate) const CELL_HEIGHT: f64 = 24.0;
+use crate::layout::LayoutMetrics;
+use crate::renderer::atlas::GlyphAtlas;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Color(pub(crate) [f32; 4]);
@@ -23,6 +18,7 @@ const CHROME_HEADER: Color = Color::rgba(0.12, 0.14, 0.19, 1.0);
 const GRID_BACKGROUND: Color = Color::rgba(0.05, 0.07, 0.10, 1.0);
 const EMPTY_CELL_FILL: Color = Color::rgba(0.13, 0.16, 0.20, 1.0);
 const CURSOR_FILL: Color = Color::rgba(0.95, 0.96, 0.98, 0.18);
+const SELECTION_FILL: Color = Color::rgba(0.46, 0.64, 0.92, 0.30);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cell {
@@ -50,36 +46,59 @@ pub struct CursorState {
     pub visible: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct RenderState {
-    cols: u16,
-    rows: u16,
-    cells: Vec<Cell>,
-    cursor: Option<CursorState>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveScreen {
+    Primary,
+    Alternate,
 }
 
-impl RenderState {
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct RenderDamage {
+    pub full_rebuild: bool,
+    pub dirty_rows: BTreeSet<u16>,
+    pub selection_dirty: bool,
+    pub cursor_dirty: bool,
+    pub global_dirty: bool,
+}
+
+impl RenderDamage {}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderSnapshot {
+    pub cols: u16,
+    pub rows: u16,
+    pub cells: Vec<Cell>,
+    pub cursor: Option<CursorState>,
+    pub active_screen: ActiveScreen,
+    pub damage: RenderDamage,
+}
+
+impl RenderSnapshot {
     pub fn new(cols: u16, rows: u16) -> Self {
         let cols = cols.max(1);
         let rows = rows.max(1);
-        let len = cols as usize * rows as usize;
         Self {
             cols,
             rows,
-            cells: vec![Cell::default(); len],
+            cells: vec![Cell::default(); cols as usize * rows as usize],
             cursor: None,
-        }
-    }
-
-    pub fn set_char(&mut self, row: u16, col: u16, ch: char) {
-        if let Some(cell) = self.cell_mut(row, col) {
-            cell.ch = ch;
+            active_screen: ActiveScreen::Primary,
+            damage: RenderDamage {
+                full_rebuild: true,
+                ..RenderDamage::default()
+            },
         }
     }
 
     pub fn set_cell(&mut self, row: u16, col: u16, cell: Cell) {
-        if let Some(slot) = self.cell_mut(row, col) {
-            *slot = cell;
+        if let Some(index) = self.index(row, col) {
+            self.cells[index] = cell;
+        }
+    }
+
+    pub fn set_char(&mut self, row: u16, col: u16, ch: char) {
+        if let Some(index) = self.index(row, col) {
+            self.cells[index].ch = ch;
         }
     }
 
@@ -87,21 +106,16 @@ impl RenderState {
         self.cursor = cursor;
     }
 
-    pub fn cursor(&self) -> Option<CursorState> {
-        self.cursor
+    pub fn set_active_screen(&mut self, active_screen: ActiveScreen) {
+        self.active_screen = active_screen;
+    }
+
+    pub fn cell(&self, row: u16, col: u16) -> Option<&Cell> {
+        self.index(row, col).and_then(|index| self.cells.get(index))
     }
 
     pub fn char_at(&self, row: u16, col: u16) -> char {
         self.cell(row, col).map(|cell| cell.ch).unwrap_or(' ')
-    }
-
-    fn cell(&self, row: u16, col: u16) -> Option<&Cell> {
-        self.index(row, col).and_then(|index| self.cells.get(index))
-    }
-
-    fn cell_mut(&mut self, row: u16, col: u16) -> Option<&mut Cell> {
-        self.index(row, col)
-            .and_then(move |index| self.cells.get_mut(index))
     }
 
     fn index(&self, row: u16, col: u16) -> Option<usize> {
@@ -112,21 +126,46 @@ impl RenderState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct LayoutMetrics {
-    pub(crate) view_width: f32,
-    pub(crate) view_height: f32,
-    pub(crate) terminal_x: f32,
-    pub(crate) terminal_y: f32,
-    pub(crate) terminal_width: f32,
-    pub(crate) terminal_height: f32,
-    pub(crate) header_height: f32,
-    pub(crate) content_x: f32,
-    pub(crate) content_y: f32,
-    pub(crate) content_width: f32,
-    pub(crate) content_height: f32,
-    pub(crate) cell_width: f32,
-    pub(crate) cell_height: f32,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectionRange {
+    pub start_row: u16,
+    pub start_col: u16,
+    pub end_row: u16,
+    pub end_col: u16,
+}
+
+impl SelectionRange {
+    pub fn normalized(self) -> Self {
+        if (self.start_row, self.start_col) <= (self.end_row, self.end_col) {
+            self
+        } else {
+            Self {
+                start_row: self.end_row,
+                start_col: self.end_col,
+                end_row: self.start_row,
+                end_col: self.start_col,
+            }
+        }
+    }
+
+    pub fn contains(self, row: u16, col: u16) -> bool {
+        let normalized = self.normalized();
+        if row < normalized.start_row || row > normalized.end_row {
+            return false;
+        }
+        if normalized.start_row == normalized.end_row {
+            return row == normalized.start_row
+                && col >= normalized.start_col
+                && col <= normalized.end_col;
+        }
+        if row == normalized.start_row {
+            return col >= normalized.start_col;
+        }
+        if row == normalized.end_row {
+            return col <= normalized.end_col;
+        }
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -148,159 +187,136 @@ pub(crate) struct TextInstance {
     pub(crate) color: [f32; 4],
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct SceneGeometry {
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RowGeometry {
     pub(crate) background_quads: Vec<Quad>,
     pub(crate) text_instances: Vec<TextInstance>,
     pub(crate) overlay_quads: Vec<Quad>,
 }
 
-pub fn terminal_grid_size(view_width: f64, view_height: f64) -> (u16, u16) {
-    let inner_width =
-        (view_width - (OUTER_PADDING_X * 2.0) - (GRID_PADDING_X * 2.0)).max(CELL_WIDTH);
-    let inner_height =
-        (view_height - (OUTER_PADDING_Y * 2.0) - HEADER_HEIGHT - (GRID_PADDING_Y * 2.0))
-            .max(CELL_HEIGHT);
-
-    let cols = (inner_width / CELL_WIDTH).floor().max(8.0) as u16;
-    let rows = (inner_height / CELL_HEIGHT).floor().max(6.0) as u16;
-    (cols, rows)
+pub(crate) fn build_chrome_quads(metrics: LayoutMetrics) -> Vec<Quad> {
+    vec![
+        Quad {
+            x: metrics.terminal_x,
+            y: metrics.terminal_y,
+            width: metrics.terminal_width,
+            height: metrics.terminal_height,
+            color: CHROME_BACKGROUND,
+        },
+        Quad {
+            x: metrics.terminal_x - 1.0,
+            y: metrics.terminal_y - 1.0,
+            width: metrics.terminal_width + 2.0,
+            height: metrics.terminal_height + 2.0,
+            color: CHROME_BORDER,
+        },
+        Quad {
+            x: metrics.terminal_x,
+            y: metrics.terminal_y,
+            width: metrics.terminal_width,
+            height: metrics.header_height,
+            color: CHROME_HEADER,
+        },
+        Quad {
+            x: metrics.content_x,
+            y: metrics.content_y,
+            width: metrics.content_width,
+            height: metrics.content_height,
+            color: GRID_BACKGROUND,
+        },
+    ]
 }
 
-pub(crate) fn layout_metrics(view_width: f64, view_height: f64, state: &RenderState) -> LayoutMetrics {
-    let view_width = view_width.max(1.0) as f32;
-    let view_height = view_height.max(1.0) as f32;
-    let padding_x = OUTER_PADDING_X as f32;
-    let padding_y = OUTER_PADDING_Y as f32;
-    let header_height = HEADER_HEIGHT as f32;
-    let grid_padding_x = GRID_PADDING_X as f32;
-    let grid_padding_y = GRID_PADDING_Y as f32;
-    let cell_width = CELL_WIDTH as f32;
-    let cell_height = CELL_HEIGHT as f32;
-    let terminal_x = padding_x;
-    let terminal_y = padding_y;
-    let terminal_width = (view_width - (padding_x * 2.0)).max(180.0);
-    let terminal_height = (view_height - (padding_y * 2.0)).max(160.0);
-    let content_x = terminal_x + grid_padding_x;
-    let content_y = terminal_y + header_height + grid_padding_y;
-    let content_width = state.cols as f32 * cell_width;
-    let content_height = state.rows as f32 * cell_height;
-
-    LayoutMetrics {
-        view_width,
-        view_height,
-        terminal_x,
-        terminal_y,
-        terminal_width,
-        terminal_height,
-        header_height,
-        content_x,
-        content_y,
-        content_width,
-        content_height,
-        cell_width,
-        cell_height,
-    }
-}
-
-pub(crate) fn build_scene_geometry(
+pub(crate) fn build_row_geometry(
     metrics: LayoutMetrics,
-    state: &RenderState,
+    snapshot: &RenderSnapshot,
     atlas: &GlyphAtlas,
-) -> SceneGeometry {
-    let mut background_quads = Vec::new();
-    let mut text_instances = Vec::new();
-    let mut overlay_quads = Vec::new();
+    row: u16,
+    selection: Option<SelectionRange>,
+) -> RowGeometry {
+    let mut geometry = RowGeometry::default();
     let tile_width = (metrics.cell_width - 4.0).max(6.0);
     let tile_height = (metrics.cell_height - 4.0).max(8.0);
 
-    background_quads.push(Quad {
-        x: metrics.terminal_x,
-        y: metrics.terminal_y,
-        width: metrics.terminal_width,
-        height: metrics.terminal_height,
-        color: CHROME_BACKGROUND,
-    });
-    background_quads.push(Quad {
-        x: metrics.terminal_x - 1.0,
-        y: metrics.terminal_y - 1.0,
-        width: metrics.terminal_width + 2.0,
-        height: metrics.terminal_height + 2.0,
-        color: CHROME_BORDER,
-    });
-    background_quads.push(Quad {
-        x: metrics.terminal_x,
-        y: metrics.terminal_y,
-        width: metrics.terminal_width,
-        height: metrics.header_height,
-        color: CHROME_HEADER,
-    });
-    background_quads.push(Quad {
-        x: metrics.content_x,
-        y: metrics.content_y,
-        width: metrics.content_width,
-        height: metrics.content_height,
-        color: GRID_BACKGROUND,
-    });
+    for col in 0..snapshot.cols {
+        let cell = snapshot
+            .cell(row, col)
+            .copied()
+            .unwrap_or_else(Cell::default);
+        let x = metrics.content_x + (col as f32 * metrics.cell_width) + 2.0;
+        let y = metrics.content_y + (row as f32 * metrics.cell_height) + 2.0;
 
-    for row in 0..state.rows {
-        for col in 0..state.cols {
-            let cell = state.cells[state.index(row, col).expect("in-bounds cell index")];
-            let x = metrics.content_x + (col as f32 * metrics.cell_width) + 2.0;
-            let y = metrics.content_y + (row as f32 * metrics.cell_height) + 2.0;
+        geometry.background_quads.push(Quad {
+            x,
+            y,
+            width: tile_width,
+            height: tile_height,
+            color: Color(cell.bg),
+        });
 
-            background_quads.push(Quad {
-                x,
-                y,
-                width: tile_width,
-                height: tile_height,
-                color: Color(cell.bg),
+        if let Some(selection) = selection.filter(|selection| selection.contains(row, col)) {
+            let _ = selection;
+            geometry.overlay_quads.push(Quad {
+                x: metrics.content_x + (col as f32 * metrics.cell_width),
+                y: metrics.content_y + (row as f32 * metrics.cell_height),
+                width: metrics.cell_width,
+                height: metrics.cell_height,
+                color: SELECTION_FILL,
             });
+        }
 
-            if cell.ch != ' ' {
-                let glyph = atlas.glyph_for(cell.ch);
-                if glyph.bitmap_size[0] > 0.0 && glyph.bitmap_size[1] > 0.0 {
-                    text_instances.push(TextInstance {
-                        origin: [
-                            metrics.content_x + (col as f32 * metrics.cell_width) + glyph.offset[0],
-                            metrics.content_y + (row as f32 * metrics.cell_height) + glyph.offset[1],
-                        ],
-                        size: glyph.bitmap_size,
-                        uv_origin: glyph.uv_origin,
-                        uv_size: glyph.uv_size,
-                        color: cell.fg,
-                    });
-                }
+        if cell.ch != ' ' {
+            let glyph = atlas.glyph_for(cell.ch);
+            if glyph.bitmap_size[0] > 0.0 && glyph.bitmap_size[1] > 0.0 {
+                geometry.text_instances.push(TextInstance {
+                    origin: [
+                        metrics.content_x + (col as f32 * metrics.cell_width) + glyph.offset[0],
+                        metrics.content_y + (row as f32 * metrics.cell_height) + glyph.offset[1],
+                    ],
+                    size: glyph.bitmap_size,
+                    uv_origin: glyph.uv_origin,
+                    uv_size: glyph.uv_size,
+                    color: cell.fg,
+                });
             }
         }
     }
 
-    if let Some(cursor) = state.cursor.filter(|cursor| cursor.visible) {
-        let cursor_col = cursor.col.min(state.cols.saturating_sub(1));
-        let cursor_row = cursor.row.min(state.rows.saturating_sub(1));
-        overlay_quads.push(Quad {
-            x: metrics.content_x + (cursor_col as f32 * metrics.cell_width) + 1.0,
-            y: metrics.content_y + (cursor_row as f32 * metrics.cell_height) + 1.0,
-            width: metrics.cell_width - 2.0,
-            height: metrics.cell_height - 2.0,
-            color: CURSOR_FILL,
-        });
-    }
+    geometry
+}
 
-    SceneGeometry {
-        background_quads,
-        text_instances,
-        overlay_quads,
-    }
+pub(crate) fn build_cursor_quad(
+    metrics: LayoutMetrics,
+    snapshot: &RenderSnapshot,
+    cursor_visible: bool,
+) -> Option<Quad> {
+    let cursor = snapshot
+        .cursor
+        .filter(|cursor| cursor.visible && cursor_visible)?;
+    let cursor_col = cursor.col.min(snapshot.cols.saturating_sub(1));
+    let cursor_row = cursor.row.min(snapshot.rows.saturating_sub(1));
+    Some(Quad {
+        x: metrics.content_x + (cursor_col as f32 * metrics.cell_width) + 1.0,
+        y: metrics.content_y + (cursor_row as f32 * metrics.cell_height) + 1.0,
+        width: metrics.cell_width - 2.0,
+        height: metrics.cell_height - 2.0,
+        color: CURSOR_FILL,
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use crate::layout::layout_metrics;
     use objc2_metal::MTLCreateSystemDefaultDevice;
 
     use crate::renderer::atlas::GlyphAtlas;
 
-    use super::{CursorState, RenderState, build_scene_geometry, layout_metrics, terminal_grid_size};
+    use super::{
+        CursorState, RenderDamage, RenderSnapshot, SelectionRange, build_chrome_quads,
+        build_cursor_quad, build_row_geometry,
+    };
 
     fn atlas() -> GlyphAtlas {
         let device = MTLCreateSystemDefaultDevice().expect("default metal device");
@@ -308,46 +324,73 @@ mod tests {
     }
 
     #[test]
-    fn grid_size_has_minimums() {
-        assert_eq!(terminal_grid_size(120.0, 80.0), (8, 6));
+    fn chrome_contains_frame_quads() {
+        let metrics = layout_metrics(300.0, 240.0, 2, 2);
+        assert_eq!(build_chrome_quads(metrics).len(), 4);
     }
 
     #[test]
-    fn grid_size_scales_with_viewport() {
-        assert_eq!(terminal_grid_size(900.0, 640.0), (50, 21));
+    fn row_geometry_emits_text_and_selection() {
+        let mut snapshot = RenderSnapshot::new(2, 2);
+        snapshot.set_char(0, 0, 'A');
+        let metrics = layout_metrics(300.0, 240.0, snapshot.cols, snapshot.rows);
+        let geometry = build_row_geometry(
+            metrics,
+            &snapshot,
+            &atlas(),
+            0,
+            Some(SelectionRange {
+                start_row: 0,
+                start_col: 0,
+                end_row: 0,
+                end_col: 0,
+            }),
+        );
+
+        assert_eq!(geometry.background_quads.len(), 2);
+        assert_eq!(geometry.text_instances.len(), 1);
+        assert_eq!(geometry.overlay_quads.len(), 1);
     }
 
     #[test]
-    fn empty_scene_contains_only_frame_and_cell_backgrounds() {
-        let state = RenderState::new(2, 2);
-        let metrics = layout_metrics(300.0, 240.0, &state);
-        let scene = build_scene_geometry(metrics, &state, &atlas());
-
-        assert_eq!(scene.background_quads.len(), 8);
-        assert!(scene.text_instances.is_empty());
-        assert!(scene.overlay_quads.is_empty());
-    }
-
-    #[test]
-    fn non_empty_cells_and_cursor_add_visible_instances() {
-        let mut state = RenderState::new(2, 2);
-        state.set_char(0, 0, 'A');
-        state.set_char(1, 1, 'B');
-        state.set_cursor(Some(CursorState {
+    fn cursor_quad_respects_visibility() {
+        let mut snapshot = RenderSnapshot::new(2, 2);
+        snapshot.set_cursor(Some(CursorState {
             row: 1,
-            col: 0,
+            col: 1,
             visible: true,
         }));
+        let metrics = layout_metrics(300.0, 240.0, snapshot.cols, snapshot.rows);
+        assert!(build_cursor_quad(metrics, &snapshot, true).is_some());
+        assert!(build_cursor_quad(metrics, &snapshot, false).is_none());
+    }
 
-        let metrics = layout_metrics(300.0, 240.0, &state);
-        let scene = build_scene_geometry(metrics, &state, &atlas());
+    #[test]
+    fn selection_normalization_contains_rows() {
+        let selection = SelectionRange {
+            start_row: 2,
+            start_col: 4,
+            end_row: 1,
+            end_col: 1,
+        }
+        .normalized();
+        assert!(selection.contains(1, 1));
+        assert!(selection.contains(2, 4));
+        assert!(selection.contains(2, 0));
+        assert!(!selection.contains(0, 0));
+    }
 
-        assert_eq!(scene.background_quads.len(), 8);
-        assert_eq!(scene.text_instances.len(), 2);
-        assert_eq!(scene.overlay_quads.len(), 1);
-        assert!(scene.text_instances[0].size[0] > 0.0);
-        assert!(scene.text_instances[0].size[1] > 0.0);
-        assert!(scene.text_instances[0].origin[0] >= metrics.content_x);
-        assert!(scene.text_instances[0].origin[1] >= metrics.content_y - 4.0);
+    #[test]
+    fn damage_default_is_empty() {
+        assert_eq!(
+            RenderDamage::default(),
+            RenderDamage {
+                full_rebuild: false,
+                dirty_rows: BTreeSet::new(),
+                selection_dirty: false,
+                cursor_dirty: false,
+                global_dirty: false,
+            }
+        );
     }
 }

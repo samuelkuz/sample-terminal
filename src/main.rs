@@ -1,6 +1,9 @@
 #![allow(unexpected_cfgs)]
 
 mod app;
+mod app_state;
+mod input;
+mod layout;
 mod renderer;
 mod session;
 mod terminal_buffer;

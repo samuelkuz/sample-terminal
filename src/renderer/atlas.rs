@@ -3,11 +3,11 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use objc2::runtime::ProtocolObject;
-use objc2_core_foundation::{CGAffineTransform, CFString, CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{CFString, CGAffineTransform, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGColorSpace, CGContext, CGGlyph, CGImageAlphaInfo,
 };
-use objc2_core_text::{CTFont, CTFontOrientation, CTFontOptions};
+use objc2_core_text::{CTFont, CTFontOptions, CTFontOrientation};
 use objc2_metal::{
     MTLDevice, MTLPixelFormat, MTLRegion, MTLResourceOptions, MTLSize, MTLTexture,
     MTLTextureDescriptor, MTLTextureUsage,
@@ -78,7 +78,12 @@ impl GlyphAtlas {
                         raster.bitmap_height as f32 / atlas_pack.size[1] as f32,
                     ],
                     bitmap_size: [raster.bitmap_width as f32, raster.bitmap_height as f32],
-                    offset: [metrics.horizontal_inset + raster.bounds.origin.x as f32, metrics.baseline - raster.bounds.origin.y as f32 - raster.bounds.size.height as f32],
+                    offset: [
+                        metrics.horizontal_inset + raster.bounds.origin.x as f32,
+                        metrics.baseline
+                            - raster.bounds.origin.y as f32
+                            - raster.bounds.size.height as f32,
+                    ],
                     advance: raster.advance.width as f32,
                     atlas_origin: [placement.x, placement.y],
                 },
@@ -170,7 +175,10 @@ fn compute_font_metrics(font: &CTFont) -> FontMetrics {
     }
 }
 
-fn build_glyph_rasters(font: &CTFont, metrics: FontMetrics) -> Result<Vec<RasterizedGlyph>, String> {
+fn build_glyph_rasters(
+    font: &CTFont,
+    metrics: FontMetrics,
+) -> Result<Vec<RasterizedGlyph>, String> {
     let mut rasters = Vec::new();
     for ch in supported_chars() {
         let glyph_id = glyph_for_char(font, ch)?;
@@ -253,8 +261,8 @@ fn rasterize_glyph(
     width: usize,
     height: usize,
 ) -> Result<Vec<u8>, String> {
-    let color_space =
-        CGColorSpace::new_device_gray().ok_or_else(|| "failed to create gray color space".to_string())?;
+    let color_space = CGColorSpace::new_device_gray()
+        .ok_or_else(|| "failed to create gray color space".to_string())?;
     let mut bitmap = vec![0u8; width * height];
     let context = unsafe {
         CGBitmapContextCreate(
@@ -278,7 +286,10 @@ fn rasterize_glyph(
     CGContext::set_gray_fill_color(Some(&context), 1.0, 1.0);
     CGContext::clear_rect(
         Some(&context),
-        CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(width as f64, height as f64)),
+        CGRect::new(
+            CGPoint::new(0.0, 0.0),
+            CGSize::new(width as f64, height as f64),
+        ),
     );
     CGContext::translate_ctm(Some(&context), 0.0, height as f64);
     CGContext::scale_ctm(Some(&context), 1.0, -1.0);
@@ -409,7 +420,10 @@ fn supported_chars() -> Vec<char> {
 mod tests {
     use objc2_metal::MTLCreateSystemDefaultDevice;
 
-    use super::{build_glyph_rasters, compute_font_metrics, load_font, pack_glyphs, AtlasPlacement, RasterizedGlyph};
+    use super::{
+        AtlasPlacement, RasterizedGlyph, build_glyph_rasters, compute_font_metrics, load_font,
+        pack_glyphs,
+    };
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use std::collections::HashSet;
 
@@ -417,7 +431,10 @@ mod tests {
         RasterizedGlyph {
             ch,
             glyph_id: ch as u16,
-            bounds: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(width as f64, height as f64)),
+            bounds: CGRect::new(
+                CGPoint::new(0.0, 0.0),
+                CGSize::new(width as f64, height as f64),
+            ),
             advance: CGSize::new(width as f64, 0.0),
             bitmap_width: width,
             bitmap_height: height,
@@ -460,7 +477,10 @@ mod tests {
         let font = load_font();
         let metrics = compute_font_metrics(&font);
         let rasters = build_glyph_rasters(&font, metrics).expect("glyph rasters");
-        let glyph = rasters.iter().find(|glyph| glyph.ch == 'A').expect("A glyph");
+        let glyph = rasters
+            .iter()
+            .find(|glyph| glyph.ch == 'A')
+            .expect("A glyph");
 
         assert!(glyph.bitmap_width > 0);
         assert!(glyph.bitmap_height > 0);
