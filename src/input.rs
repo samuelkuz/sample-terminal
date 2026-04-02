@@ -1,9 +1,6 @@
 use objc2_app_kit::{
-    NSDownArrowFunctionKey, NSLeftArrowFunctionKey, NSRightArrowFunctionKey,
-    NSUpArrowFunctionKey,
+    NSDownArrowFunctionKey, NSLeftArrowFunctionKey, NSRightArrowFunctionKey, NSUpArrowFunctionKey,
 };
-
-use crate::app_state::SelectionState;
 
 pub enum SelectionPhase {
     Start,
@@ -11,7 +8,7 @@ pub enum SelectionPhase {
     End,
 }
 
-pub fn terminal_input_bytes(text: &str) -> Option<Vec<u8>> {
+pub fn translate_terminal_input(text: &str) -> Option<Vec<u8>> {
     if text.is_empty() {
         return None;
     }
@@ -33,32 +30,33 @@ pub fn terminal_input_bytes(text: &str) -> Option<Vec<u8>> {
     Some(text.as_bytes().to_vec())
 }
 
-pub fn apply_selection_gesture(
-    selection: &mut SelectionState,
+pub fn reduce_selection_phase(
+    anchor: Option<(u16, u16)>,
+    focus: Option<(u16, u16)>,
+    dragging: bool,
     phase: SelectionPhase,
     cell: Option<(u16, u16)>,
-) {
+) -> (Option<(u16, u16)>, Option<(u16, u16)>, bool) {
     match phase {
-        SelectionPhase::Start => {
-            selection.anchor = cell;
-            selection.focus = cell;
-            selection.dragging = cell.is_some();
-        }
+        SelectionPhase::Start => (cell, cell, cell.is_some()),
         SelectionPhase::Update => {
-            if selection.dragging {
-                selection.focus = cell.or(selection.focus);
+            if dragging {
+                (anchor, cell.or(focus), dragging)
+            } else {
+                (anchor, focus, dragging)
             }
         }
         SelectionPhase::End => {
-            if selection.dragging {
-                selection.focus = cell.or(selection.focus);
+            if dragging {
+                (anchor, cell.or(focus), false)
+            } else {
+                (anchor, focus, false)
             }
-            selection.dragging = false;
         }
     }
 }
 
-pub fn normalized_scroll_lines(raw_delta: f64, precise: bool) -> i32 {
+pub fn normalize_scroll_lines(raw_delta: f64, precise: bool) -> i32 {
     if raw_delta == 0.0 {
         return 0;
     }
@@ -77,19 +75,31 @@ pub fn normalized_scroll_lines(raw_delta: f64, precise: bool) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::terminal_input_bytes;
+    use super::translate_terminal_input;
 
     #[test]
     fn translates_arrow_keys_to_terminal_sequences() {
-        assert_eq!(terminal_input_bytes("\u{f700}"), Some(b"\x1b[A".to_vec()));
-        assert_eq!(terminal_input_bytes("\u{f701}"), Some(b"\x1b[B".to_vec()));
-        assert_eq!(terminal_input_bytes("\u{f702}"), Some(b"\x1b[D".to_vec()));
-        assert_eq!(terminal_input_bytes("\u{f703}"), Some(b"\x1b[C".to_vec()));
+        assert_eq!(
+            translate_terminal_input("\u{f700}"),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            translate_terminal_input("\u{f701}"),
+            Some(b"\x1b[B".to_vec())
+        );
+        assert_eq!(
+            translate_terminal_input("\u{f702}"),
+            Some(b"\x1b[D".to_vec())
+        );
+        assert_eq!(
+            translate_terminal_input("\u{f703}"),
+            Some(b"\x1b[C".to_vec())
+        );
     }
 
     #[test]
     fn preserves_plain_text_input() {
-        assert_eq!(terminal_input_bytes("abc"), Some(b"abc".to_vec()));
-        assert_eq!(terminal_input_bytes(""), None);
+        assert_eq!(translate_terminal_input("abc"), Some(b"abc".to_vec()));
+        assert_eq!(translate_terminal_input(""), None);
     }
 }

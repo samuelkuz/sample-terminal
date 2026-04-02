@@ -1,5 +1,5 @@
-use super::types::{DEFAULT_BG, DEFAULT_FG};
 use super::TerminalBuffer;
+use super::types::{DEFAULT_BG, DEFAULT_FG};
 
 pub(crate) fn ansi_16_color(index: u8, bright: bool) -> [f32; 4] {
     const NORMAL: [[f32; 4]; 8] = [

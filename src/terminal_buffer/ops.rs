@@ -350,7 +350,8 @@ impl TerminalBuffer {
     }
 
     fn set_blank(&mut self, row: u16, col: u16) {
-        self.screen_mut().set_cell(row, col, TerminalCell::default());
+        self.screen_mut()
+            .set_cell(row, col, TerminalCell::default());
         self.damage.mark_row(row);
     }
 

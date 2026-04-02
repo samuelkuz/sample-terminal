@@ -16,7 +16,7 @@ pub struct TerminalSession {
 
 impl TerminalSession {
     pub fn spawn() -> Result<Self, String> {
-        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        let shell = default_shell_path();
         let shell_cstr = CString::new(shell.as_str())
             .map_err(|_| "shell path contains an interior null byte".to_string())?;
         let argv = vec![
@@ -41,27 +41,8 @@ impl TerminalSession {
             ForkptyResult::Parent { master, child } => {
                 let master_fd = Arc::new(master);
                 let (sender, receiver) = mpsc::channel();
-                let reader_fd = Arc::clone(&master_fd);
-
-                thread::spawn(move || {
-                    let mut buffer = [0_u8; 4096];
-
-                    loop {
-                        match read(reader_fd.as_fd(), &mut buffer) {
-                            Ok(0) => break,
-                            Ok(count) => {
-                                if sender.send(buffer[..count].to_vec()).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                });
-
-                thread::spawn(move || {
-                    let _ = waitpid(child, None);
-                });
+                spawn_reader_loop(Arc::clone(&master_fd), sender);
+                spawn_reaper(child);
 
                 Ok(Self {
                     master_fd,
@@ -98,4 +79,32 @@ impl TerminalSession {
 
         let _ = unsafe { libc::ioctl(self.master_fd.as_raw_fd(), libc::TIOCSWINSZ, &winsize) };
     }
+}
+
+fn default_shell_path() -> String {
+    env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+}
+
+fn spawn_reader_loop(master_fd: Arc<OwnedFd>, sender: mpsc::Sender<Vec<u8>>) {
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+
+        loop {
+            match read(master_fd.as_fd(), &mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    if sender.send(buffer[..count].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn spawn_reaper(child: nix::unistd::Pid) {
+    thread::spawn(move || {
+        let _ = waitpid(child, None);
+    });
 }

@@ -12,7 +12,7 @@ use objc2_app_kit::{
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer};
 
 use crate::app_state::AppState;
-use crate::input::{SelectionPhase, normalized_scroll_lines, terminal_input_bytes};
+use crate::input::{SelectionPhase, normalize_scroll_lines, translate_terminal_input};
 use crate::layout::{point_to_cell, terminal_grid_size};
 use crate::renderer::{RenderFrameInput, TerminalRenderer};
 
@@ -23,8 +23,7 @@ static APP_STATE: OnceLock<Arc<AppState>> = OnceLock::new();
 
 pub fn run() -> Result<(), String> {
     let mtm = MainThreadMarker::new().ok_or("failed to acquire main thread marker")?;
-    let (cols, rows) = terminal_grid_size(WINDOW_WIDTH, WINDOW_HEIGHT);
-    let state = Arc::new(AppState::new(cols, rows)?);
+    let state = Arc::new(AppState::new_for_window(WINDOW_WIDTH, WINDOW_HEIGHT)?);
     APP_STATE
         .set(Arc::clone(&state))
         .map_err(|_| "application state already initialized".to_string())?;
@@ -104,6 +103,10 @@ fn create_window(mtm: MainThreadMarker) -> Retained<NSWindow> {
 
 fn app_state() -> Option<&'static Arc<AppState>> {
     APP_STATE.get()
+}
+
+fn with_app_state<R>(f: impl FnOnce(&Arc<AppState>) -> R) -> Option<R> {
+    app_state().map(f)
 }
 
 define_class!(
@@ -251,62 +254,53 @@ impl TimerTarget {
 }
 
 fn key_down_impl(event: &NSEvent) {
-    let Some(state) = app_state() else {
-        return;
-    };
-
     let Some(characters) = event.characters() else {
         return;
     };
 
     let text = characters.to_string();
-    if let Some(sequence) = terminal_input_bytes(&text) {
-        state.send_input(&sequence);
-    }
+    let _ = with_app_state(|state| {
+        if let Some(sequence) = translate_terminal_input(&text) {
+            state.send_input(&sequence);
+        }
+    });
 }
 
-fn selection_event(view: &TerminalView, event: &NSEvent, phase: SelectionPhase) {
-    let Some(app_state) = app_state() else {
-        return;
-    };
-
+fn selection_cell(view: &TerminalView, event: &NSEvent) -> Option<(u16, u16)> {
     let bounds = view.bounds();
     let (cols, rows) = terminal_grid_size(bounds.size.width, bounds.size.height);
     let point = view.convertPoint_fromView(event.locationInWindow(), None);
-    let cell = point_to_cell(
+    point_to_cell(
         bounds.size.width,
         bounds.size.height,
         cols,
         rows,
         point.x,
         point.y,
-    );
+    )
+}
 
-    app_state.update_selection(phase, cell);
+fn selection_event(view: &TerminalView, event: &NSEvent, phase: SelectionPhase) {
+    let cell = selection_cell(view, event);
+    let _ = with_app_state(|state| state.update_selection(phase, cell));
     render_view(view);
 }
 
 fn scroll_event(view: &TerminalView, event: &NSEvent) {
-    let Some(app_state) = app_state() else {
-        return;
-    };
-
-    let lines = normalized_scroll_lines(event.scrollingDeltaY(), event.hasPreciseScrollingDeltas());
+    let lines = normalize_scroll_lines(event.scrollingDeltaY(), event.hasPreciseScrollingDeltas());
     if lines == 0 {
         return;
     }
 
-    app_state.scroll_viewport(lines);
-    app_state.stop_selection_drag();
+    let _ = with_app_state(|state| {
+        state.scroll_viewport(lines);
+        state.stop_selection_drag();
+    });
 
     render_view(view);
 }
 
 fn render_view(view: &TerminalView) {
-    let Some(app_state) = app_state() else {
-        return;
-    };
-
     let Ok(mut state) = view.ivars().try_borrow_mut() else {
         return;
     };
@@ -324,16 +318,21 @@ fn render_view(view: &TerminalView) {
         .map(|window| window.backingScaleFactor())
         .unwrap_or(1.0);
     let (terminal_cols, terminal_rows) = terminal_grid_size(bounds.size.width, bounds.size.height);
-    app_state.sync_window_size(
-        terminal_cols,
-        terminal_rows,
-        backing.size.width.round().clamp(1.0, u16::MAX as f64) as u16,
-        backing.size.height.round().clamp(1.0, u16::MAX as f64) as u16,
-    );
+    let Some((cursor_visible, selection, render_state)) = with_app_state(|app_state| {
+        app_state.sync_window_size(
+            terminal_cols,
+            terminal_rows,
+            backing.size.width.round().clamp(1.0, u16::MAX as f64) as u16,
+            backing.size.height.round().clamp(1.0, u16::MAX as f64) as u16,
+        );
 
-    let cursor_visible = app_state.cursor_visible();
-    let selection = app_state.selection_range();
-    let render_state = app_state.render_snapshot(terminal_cols, terminal_rows, cursor_visible);
+        let cursor_visible = app_state.cursor_visible();
+        let selection = app_state.selection_range();
+        let render_state = app_state.render_snapshot(terminal_cols, terminal_rows, cursor_visible);
+        (cursor_visible, selection, render_state)
+    }) else {
+        return;
+    };
 
     let input = RenderFrameInput {
         view_width: bounds.size.width,
@@ -351,11 +350,8 @@ fn render_view(view: &TerminalView) {
 }
 
 fn tick_impl() {
-    let Some(state) = app_state() else {
-        return;
-    };
-
-    let should_render = state.poll_session_and_should_render();
+    let should_render =
+        with_app_state(|state| state.poll_session_and_should_render()).unwrap_or(false);
     if !should_render {
         return;
     }

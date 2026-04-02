@@ -7,14 +7,17 @@ mod types;
 use std::collections::VecDeque;
 
 use self::damage::DamageTracker;
-use self::types::{CellAttributes, ParserState, ScreenBuffer, TerminalCell};
+#[cfg(test)]
 pub(crate) use self::types::DEFAULT_FG;
+use self::types::{CellAttributes, ParserState, ScreenBuffer, TerminalCell};
 use crate::renderer::{ActiveScreen, CursorState, RenderSnapshot};
 
 const SCROLLBACK_CAPACITY: usize = 2_000;
 
 #[derive(Debug)]
 pub struct TerminalBuffer {
+    // The root module owns the persistent terminal state; parser/color/ops modules
+    // provide the behavior that mutates it.
     primary: ScreenBuffer,
     alternate: ScreenBuffer,
     active_screen: ActiveScreen,

@@ -1,5 +1,5 @@
-use super::types::ParsedCsi;
 use super::TerminalBuffer;
+use super::types::ParsedCsi;
 
 impl TerminalBuffer {
     pub(crate) fn push_byte(&mut self, byte: u8) {

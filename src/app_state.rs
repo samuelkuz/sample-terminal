@@ -1,7 +1,8 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::input::{SelectionPhase, apply_selection_gesture};
+use crate::input::{SelectionPhase, reduce_selection_phase};
+use crate::layout::terminal_grid_size;
 use crate::renderer::SelectionRange;
 use crate::session::TerminalSession;
 use crate::terminal_buffer::TerminalBuffer;
@@ -16,6 +17,11 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn new_for_window(view_width: f64, view_height: f64) -> Result<Self, String> {
+        let (cols, rows) = terminal_grid_size(view_width, view_height);
+        Self::new(cols, rows)
+    }
+
     pub fn new(cols: u16, rows: u16) -> Result<Self, String> {
         Ok(Self {
             session: TerminalSession::spawn()?,
@@ -118,7 +124,13 @@ impl AppState {
 
     pub fn update_selection(&self, phase: SelectionPhase, cell: Option<(u16, u16)>) {
         if let Ok(mut selection) = self.selection.lock() {
-            apply_selection_gesture(&mut selection, phase, cell);
+            (selection.anchor, selection.focus, selection.dragging) = reduce_selection_phase(
+                selection.anchor,
+                selection.focus,
+                selection.dragging,
+                phase,
+                cell,
+            );
         }
     }
 

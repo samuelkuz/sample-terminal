@@ -143,6 +143,18 @@ pub struct TerminalRenderer {
     last_selection: Option<SelectionRange>,
 }
 
+struct FrameResources {
+    drawable: Retained<ProtocolObject<dyn CAMetalDrawable>>,
+    command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    encoder: Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>,
+}
+
+struct DrawBatches {
+    background_quads: Vec<Quad>,
+    text_instances: Vec<TextInstance>,
+    overlay_quads: Vec<Quad>,
+}
+
 impl TerminalRenderer {
     pub fn new() -> Result<Self, String> {
         let device =
@@ -225,100 +237,16 @@ impl TerminalRenderer {
         input: RenderFrameInput,
         snapshot: &RenderSnapshot,
     ) -> Result<(), String> {
-        self.resize(
-            input.view_width,
-            input.view_height,
-            input.pixel_width,
-            input.pixel_height,
-            input.scale_factor,
-        );
+        self.update_drawable(&input);
 
-        let Some(drawable) = self.layer.nextDrawable() else {
+        let Some(frame) = self.prepare_frame_resources()? else {
             return Ok(());
         };
 
-        let pass_descriptor = MTLRenderPassDescriptor::renderPassDescriptor();
-        let color_attachments = pass_descriptor.colorAttachments();
-        let color_attachment = unsafe { color_attachments.objectAtIndexedSubscript(0) };
-        color_attachment.setTexture(Some(&*drawable.texture()));
-        color_attachment.setLoadAction(MTLLoadAction::Clear);
-        color_attachment.setStoreAction(MTLStoreAction::Store);
-        color_attachment.setClearColor(MTLClearColor {
-            red: 0.05,
-            green: 0.06,
-            blue: 0.08,
-            alpha: 1.0,
-        });
-
-        let command_buffer = self
-            .command_queue
-            .commandBuffer()
-            .ok_or("failed to create a Metal command buffer")?;
-        let encoder = command_buffer
-            .renderCommandEncoderWithDescriptor(&pass_descriptor)
-            .ok_or("failed to create a Metal render encoder")?;
-
-        encoder.setViewport(MTLViewport {
-            originX: 0.0,
-            originY: 0.0,
-            width: self.drawable_width,
-            height: self.drawable_height,
-            znear: 0.0,
-            zfar: 1.0,
-        });
-
-        let metrics = layout_metrics(
-            input.view_width,
-            input.view_height,
-            snapshot.cols,
-            snapshot.rows,
-        );
-        self.update_caches(metrics, snapshot, input.selection);
-
-        let mut background_quads = self.chrome_quads.clone();
-        let mut selection_quads = Vec::new();
-        let mut text_instances = Vec::new();
-        for row_cache in &self.row_caches {
-            background_quads.extend_from_slice(&row_cache.background_quads);
-            selection_quads.extend_from_slice(&row_cache.overlay_quads);
-            text_instances.extend_from_slice(&row_cache.text_instances);
-        }
-
-        let mut overlay_quads = selection_quads;
-        if let Some(cursor_quad) = build_cursor_quad(metrics, snapshot, input.cursor_visible) {
-            overlay_quads.push(cursor_quad);
-        }
-
-        draw_solid_pass(
-            &self.device,
-            &*encoder,
-            &self.solid_pipeline_state,
-            metrics.view_width,
-            metrics.view_height,
-            &background_quads,
-        )?;
-        draw_text_pass(
-            &self.device,
-            &*encoder,
-            &self.text_pipeline_state,
-            &self.text_sampler,
-            &self.atlas,
-            metrics.view_width,
-            metrics.view_height,
-            &text_instances,
-        )?;
-        draw_solid_pass(
-            &self.device,
-            &*encoder,
-            &self.solid_pipeline_state,
-            metrics.view_width,
-            metrics.view_height,
-            &overlay_quads,
-        )?;
-
-        encoder.endEncoding();
-        let _: () = unsafe { msg_send![&*command_buffer, presentDrawable: &*drawable] };
-        command_buffer.commit();
+        let metrics = self.update_layout_caches(&input, snapshot);
+        let batches = self.collect_draw_batches(metrics, snapshot, input.cursor_visible);
+        self.encode_draw_batches(&frame.encoder, metrics, &batches)?;
+        self.present_frame(frame);
         Ok(())
     }
 
@@ -363,6 +291,141 @@ impl TerminalRenderer {
         self.cached_cols = snapshot.cols;
         self.cached_rows = snapshot.rows;
         self.last_selection = selection;
+    }
+
+    fn update_drawable(&mut self, input: &RenderFrameInput) {
+        self.resize(
+            input.view_width,
+            input.view_height,
+            input.pixel_width,
+            input.pixel_height,
+            input.scale_factor,
+        );
+    }
+
+    fn prepare_frame_resources(&self) -> Result<Option<FrameResources>, String> {
+        let Some(drawable) = self.layer.nextDrawable() else {
+            return Ok(None);
+        };
+
+        let pass_descriptor = MTLRenderPassDescriptor::renderPassDescriptor();
+        let color_attachments = pass_descriptor.colorAttachments();
+        let color_attachment = unsafe { color_attachments.objectAtIndexedSubscript(0) };
+        color_attachment.setTexture(Some(&*drawable.texture()));
+        color_attachment.setLoadAction(MTLLoadAction::Clear);
+        color_attachment.setStoreAction(MTLStoreAction::Store);
+        color_attachment.setClearColor(MTLClearColor {
+            red: 0.05,
+            green: 0.06,
+            blue: 0.08,
+            alpha: 1.0,
+        });
+
+        let command_buffer = self
+            .command_queue
+            .commandBuffer()
+            .ok_or("failed to create a Metal command buffer")?;
+        let encoder = command_buffer
+            .renderCommandEncoderWithDescriptor(&pass_descriptor)
+            .ok_or("failed to create a Metal render encoder")?;
+
+        encoder.setViewport(MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: self.drawable_width,
+            height: self.drawable_height,
+            znear: 0.0,
+            zfar: 1.0,
+        });
+
+        Ok(Some(FrameResources {
+            drawable,
+            command_buffer,
+            encoder,
+        }))
+    }
+
+    fn update_layout_caches(
+        &mut self,
+        input: &RenderFrameInput,
+        snapshot: &RenderSnapshot,
+    ) -> LayoutMetrics {
+        let metrics = layout_metrics(
+            input.view_width,
+            input.view_height,
+            snapshot.cols,
+            snapshot.rows,
+        );
+        self.update_caches(metrics, snapshot, input.selection);
+        metrics
+    }
+
+    fn collect_draw_batches(
+        &self,
+        metrics: LayoutMetrics,
+        snapshot: &RenderSnapshot,
+        cursor_visible: bool,
+    ) -> DrawBatches {
+        let mut background_quads = self.chrome_quads.clone();
+        let mut overlay_quads = Vec::new();
+        let mut text_instances = Vec::new();
+
+        for row_cache in &self.row_caches {
+            background_quads.extend_from_slice(&row_cache.background_quads);
+            overlay_quads.extend_from_slice(&row_cache.overlay_quads);
+            text_instances.extend_from_slice(&row_cache.text_instances);
+        }
+
+        if let Some(cursor_quad) = build_cursor_quad(metrics, snapshot, cursor_visible) {
+            overlay_quads.push(cursor_quad);
+        }
+
+        DrawBatches {
+            background_quads,
+            text_instances,
+            overlay_quads,
+        }
+    }
+
+    fn encode_draw_batches(
+        &self,
+        encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+        metrics: LayoutMetrics,
+        batches: &DrawBatches,
+    ) -> Result<(), String> {
+        draw_solid_pass(
+            &self.device,
+            encoder,
+            &self.solid_pipeline_state,
+            metrics.view_width,
+            metrics.view_height,
+            &batches.background_quads,
+        )?;
+        draw_text_pass(
+            &self.device,
+            encoder,
+            &self.text_pipeline_state,
+            &self.text_sampler,
+            &self.atlas,
+            metrics.view_width,
+            metrics.view_height,
+            &batches.text_instances,
+        )?;
+        draw_solid_pass(
+            &self.device,
+            encoder,
+            &self.solid_pipeline_state,
+            metrics.view_width,
+            metrics.view_height,
+            &batches.overlay_quads,
+        )?;
+        Ok(())
+    }
+
+    fn present_frame(&self, frame: FrameResources) {
+        frame.encoder.endEncoding();
+        let _: () = unsafe { msg_send![&*frame.command_buffer, presentDrawable: &*frame.drawable] };
+        frame.command_buffer.commit();
     }
 }
 
