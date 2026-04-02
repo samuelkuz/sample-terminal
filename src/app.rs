@@ -6,13 +6,16 @@ use objc2::rc::Retained;
 use objc2::runtime::NSObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApp, NSApplicationActivationPolicy, NSBackingStoreType, NSEvent, NSResponder, NSView,
-    NSWindow, NSWindowStyleMask,
+    NSApp, NSApplicationActivationPolicy, NSBackingStoreType, NSEvent, NSEventModifierFlags,
+    NSPasteboard, NSPasteboardTypeString, NSResponder, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer};
 
 use crate::app_state::AppState;
-use crate::input::{SelectionPhase, normalize_scroll_lines, translate_terminal_input};
+use crate::input::{
+    InputModifiers, SelectionPhase, encode_paste, normalize_scroll_lines,
+    translate_terminal_input,
+};
 use crate::layout::{point_to_cell, terminal_grid_size};
 use crate::renderer::{RenderFrameInput, TerminalRenderer};
 
@@ -150,7 +153,15 @@ define_class!(
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
             let _ = catch_unwind(AssertUnwindSafe(|| {
-                key_down_impl(event);
+                key_down_impl(self, event);
+            }));
+        }
+
+        #[unsafe(method(paste:))]
+        fn paste(&self, _: Option<&NSObject>) {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                paste_impl();
+                render_view(self);
             }));
         }
 
@@ -253,17 +264,63 @@ impl TimerTarget {
     }
 }
 
-fn key_down_impl(event: &NSEvent) {
+fn key_down_impl(view: &TerminalView, event: &NSEvent) {
+    if is_command_v(event) {
+        paste_impl();
+        render_view(view);
+        return;
+    }
+
     let Some(characters) = event.characters() else {
         return;
     };
 
     let text = characters.to_string();
     let _ = with_app_state(|state| {
-        if let Some(sequence) = translate_terminal_input(&text) {
+        let modifiers = input_modifiers(event.modifierFlags());
+        if let Some(sequence) =
+            translate_terminal_input(&text, modifiers, state.application_cursor_enabled())
+        {
             state.send_input(&sequence);
         }
     });
+}
+
+fn input_modifiers(flags: NSEventModifierFlags) -> InputModifiers {
+    InputModifiers {
+        shift: flags.contains(NSEventModifierFlags::Shift),
+        control: flags.contains(NSEventModifierFlags::Control),
+        option: flags.contains(NSEventModifierFlags::Option),
+        command: flags.contains(NSEventModifierFlags::Command),
+    }
+}
+
+fn is_command_v(event: &NSEvent) -> bool {
+    if !event
+        .modifierFlags()
+        .contains(NSEventModifierFlags::Command)
+    {
+        return false;
+    }
+
+    event.charactersIgnoringModifiers().is_some_and(|characters| {
+        let text = characters.to_string();
+        text.eq_ignore_ascii_case("v")
+    })
+}
+
+fn paste_impl() {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    let string_type = unsafe { NSPasteboardTypeString };
+    let Some(text) = pasteboard.stringForType(string_type) else {
+        return;
+    };
+
+    let paste = with_app_state(|state| encode_paste(&text.to_string(), state.bracketed_paste_enabled()))
+        .flatten();
+    if let Some(bytes) = paste {
+        let _ = with_app_state(|state| state.send_input(&bytes));
+    }
 }
 
 fn selection_cell(view: &TerminalView, event: &NSEvent) -> Option<(u16, u16)> {

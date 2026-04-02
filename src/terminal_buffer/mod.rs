@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use self::damage::DamageTracker;
 #[cfg(test)]
 pub(crate) use self::types::DEFAULT_FG;
-use self::types::{CellAttributes, ParserState, ScreenBuffer, TerminalCell};
+use self::types::{CellAttributes, ParserState, ScreenBuffer, TerminalCell, TerminalModes};
 use crate::renderer::{ActiveScreen, CursorState, RenderSnapshot};
 
 const SCROLLBACK_CAPACITY: usize = 2_000;
@@ -27,6 +27,7 @@ pub struct TerminalBuffer {
     parser: ParserState,
     utf8_buffer: Vec<u8>,
     current_attr: CellAttributes,
+    modes: TerminalModes,
     damage: DamageTracker,
 }
 
@@ -47,6 +48,7 @@ impl TerminalBuffer {
             parser: ParserState::Ground,
             utf8_buffer: Vec::new(),
             current_attr: CellAttributes::default(),
+            modes: TerminalModes::default(),
             damage,
         }
     }
@@ -95,7 +97,11 @@ impl TerminalBuffer {
         self.scrollback.len()
     }
 
-    pub fn render_snapshot(&mut self, cursor_visible: bool) -> RenderSnapshot {
+    pub fn modes(&self) -> TerminalModes {
+        self.modes
+    }
+
+    pub fn render_snapshot(&mut self, blink_visible: bool) -> RenderSnapshot {
         let cols = self.screen().cols;
         let rows = self.screen().rows;
         let mut snapshot = RenderSnapshot::new(cols, rows);
@@ -116,7 +122,7 @@ impl TerminalBuffer {
         snapshot.set_cursor(Some(CursorState {
             row: cursor.cursor_row,
             col: cursor.cursor_col.min(cols - 1),
-            visible: cursor_visible && cursor_allowed,
+            visible: self.modes.cursor_visible && blink_visible && cursor_allowed,
         }));
 
         snapshot
@@ -389,5 +395,77 @@ mod tests {
         let snapshot = buffer.render_snapshot(true);
         assert!(!snapshot.damage.full_rebuild);
         assert!(snapshot.damage.dirty_rows.is_empty());
+    }
+
+    #[test]
+    fn terminal_modes_start_with_expected_defaults() {
+        let buffer = TerminalBuffer::new(3, 2);
+        let modes = buffer.modes();
+
+        assert!(modes.cursor_visible);
+        assert!(!modes.bracketed_paste);
+        assert!(!modes.application_cursor);
+        assert!(!modes.origin_mode);
+    }
+
+    #[test]
+    fn dec_cursor_visibility_controls_rendered_cursor() {
+        let mut buffer = TerminalBuffer::new(3, 2);
+        buffer.push_bytes(b"a");
+        assert_eq!(
+            buffer.render_snapshot(true).cursor,
+            Some(CursorState {
+                row: 0,
+                col: 1,
+                visible: true,
+            })
+        );
+
+        buffer.push_bytes(b"\x1b[?25l");
+        assert_eq!(
+            buffer.render_snapshot(true).cursor,
+            Some(CursorState {
+                row: 0,
+                col: 1,
+                visible: false,
+            })
+        );
+
+        buffer.push_bytes(b"\x1b[?25h");
+        assert_eq!(
+            buffer.render_snapshot(true).cursor,
+            Some(CursorState {
+                row: 0,
+                col: 1,
+                visible: true,
+            })
+        );
+    }
+
+    #[test]
+    fn dec_bracketed_paste_mode_updates_terminal_modes() {
+        let mut buffer = TerminalBuffer::new(3, 2);
+        assert!(!buffer.modes().bracketed_paste);
+
+        buffer.push_bytes(b"\x1b[?2004h");
+        assert!(buffer.modes().bracketed_paste);
+
+        buffer.push_bytes(b"\x1b[?2004l");
+        assert!(!buffer.modes().bracketed_paste);
+    }
+
+    #[test]
+    fn dec_input_modes_update_terminal_modes() {
+        let mut buffer = TerminalBuffer::new(3, 2);
+        assert!(!buffer.modes().application_cursor);
+        assert!(!buffer.modes().origin_mode);
+
+        buffer.push_bytes(b"\x1b[?1h\x1b[?6h");
+        assert!(buffer.modes().application_cursor);
+        assert!(buffer.modes().origin_mode);
+
+        buffer.push_bytes(b"\x1b[?1l\x1b[?6l");
+        assert!(!buffer.modes().application_cursor);
+        assert!(!buffer.modes().origin_mode);
     }
 }

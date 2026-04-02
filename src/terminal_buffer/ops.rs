@@ -358,6 +358,10 @@ impl TerminalBuffer {
     pub(crate) fn set_private_mode(&mut self, params: &[Option<usize>], enabled: bool) {
         for param in params.iter().copied().flatten() {
             match param {
+                1 => self.set_application_cursor(enabled),
+                25 => self.set_cursor_visibility(enabled),
+                6 => self.set_origin_mode(enabled),
+                2004 => self.set_bracketed_paste(enabled),
                 47 | 1047 | 1049 if enabled => self.enter_alternate_screen(true),
                 47 | 1047 | 1049 if !enabled => self.exit_alternate_screen(),
                 1048 if enabled => self.save_cursor(),
@@ -365,6 +369,26 @@ impl TerminalBuffer {
                 _ => {}
             }
         }
+    }
+
+    fn set_cursor_visibility(&mut self, visible: bool) {
+        if self.modes.cursor_visible == visible {
+            return;
+        }
+        self.modes.cursor_visible = visible;
+        self.damage.mark_cursor_dirty();
+    }
+
+    fn set_bracketed_paste(&mut self, enabled: bool) {
+        self.modes.bracketed_paste = enabled;
+    }
+
+    fn set_application_cursor(&mut self, enabled: bool) {
+        self.modes.application_cursor = enabled;
+    }
+
+    fn set_origin_mode(&mut self, enabled: bool) {
+        self.modes.origin_mode = enabled;
     }
 
     fn enter_alternate_screen(&mut self, clear: bool) {

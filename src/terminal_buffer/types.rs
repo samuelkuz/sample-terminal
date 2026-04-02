@@ -59,6 +59,25 @@ pub(crate) enum ParserState {
     OscEsc,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalModes {
+    pub(crate) cursor_visible: bool,
+    pub(crate) bracketed_paste: bool,
+    pub(crate) application_cursor: bool,
+    pub(crate) origin_mode: bool,
+}
+
+impl Default for TerminalModes {
+    fn default() -> Self {
+        Self {
+            cursor_visible: true,
+            bracketed_paste: false,
+            application_cursor: false,
+            origin_mode: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ScreenBuffer {
     pub(crate) cols: u16,

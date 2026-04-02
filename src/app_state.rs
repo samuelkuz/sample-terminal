@@ -115,6 +115,20 @@ impl AppState {
             .unwrap_or(true)
     }
 
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.buffer
+            .lock()
+            .map(|buffer| buffer.modes().bracketed_paste)
+            .unwrap_or(false)
+    }
+
+    pub fn application_cursor_enabled(&self) -> bool {
+        self.buffer
+            .lock()
+            .map(|buffer| buffer.modes().application_cursor)
+            .unwrap_or(false)
+    }
+
     pub fn selection_range(&self) -> Option<SelectionRange> {
         self.selection
             .lock()
