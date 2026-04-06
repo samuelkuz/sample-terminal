@@ -108,25 +108,33 @@ impl TerminalBuffer {
     }
 
     pub(crate) fn move_cursor_relative(&mut self, row_delta: i32, col_delta: i32) {
-        let row = (self.screen().cursor_row as i32 + row_delta).clamp(0, self.rows() as i32 - 1);
+        let (min_row, max_row) = self.vertical_cursor_bounds();
+        let row =
+            (self.screen().cursor_row as i32 + row_delta).clamp(min_row as i32, max_row as i32);
         let col = (self.screen().cursor_col as i32 + col_delta).clamp(0, self.cols() as i32 - 1);
-        self.screen_mut().cursor_row = row as u16;
-        self.screen_mut().cursor_col = col as u16;
-        self.screen_mut().wrap_pending = false;
-        self.damage.mark_cursor_dirty();
+        self.set_cursor_position_absolute(row as u16, col as u16);
     }
 
     pub(crate) fn set_cursor_position(&mut self, row: u16, col: u16) {
-        self.screen_mut().cursor_row = row.min(self.rows() - 1);
-        self.screen_mut().cursor_col = col.min(self.cols() - 1);
-        self.screen_mut().wrap_pending = false;
-        self.damage.mark_cursor_dirty();
+        let target_row = if self.modes.origin_mode {
+            let top = self.screen().scroll_top;
+            let bottom = self.screen().scroll_bottom;
+            top.saturating_add(row.min(bottom - top))
+        } else {
+            row
+        };
+        self.set_cursor_position_absolute(target_row, col);
     }
 
     pub(crate) fn set_cursor_row(&mut self, row: u16) {
-        self.screen_mut().cursor_row = row.min(self.rows() - 1);
-        self.screen_mut().wrap_pending = false;
-        self.damage.mark_cursor_dirty();
+        let target_row = if self.modes.origin_mode {
+            let top = self.screen().scroll_top;
+            let bottom = self.screen().scroll_bottom;
+            top.saturating_add(row.min(bottom - top))
+        } else {
+            row
+        };
+        self.set_cursor_position_absolute(target_row, self.screen().cursor_col);
     }
 
     pub(crate) fn set_cursor_col(&mut self, col: u16) {
@@ -259,7 +267,7 @@ impl TerminalBuffer {
 
     pub(crate) fn restore_cursor(&mut self) {
         if let Some((row, col)) = self.screen().saved_cursor {
-            self.set_cursor_position(row, col);
+            self.set_cursor_position_absolute(row, col);
         }
     }
 
@@ -388,7 +396,26 @@ impl TerminalBuffer {
     }
 
     fn set_origin_mode(&mut self, enabled: bool) {
+        if self.modes.origin_mode == enabled {
+            return;
+        }
         self.modes.origin_mode = enabled;
+        self.set_cursor_position(0, 0);
+    }
+
+    fn set_cursor_position_absolute(&mut self, row: u16, col: u16) {
+        self.screen_mut().cursor_row = row.min(self.rows() - 1);
+        self.screen_mut().cursor_col = col.min(self.cols() - 1);
+        self.screen_mut().wrap_pending = false;
+        self.damage.mark_cursor_dirty();
+    }
+
+    fn vertical_cursor_bounds(&self) -> (u16, u16) {
+        if self.modes.origin_mode {
+            (self.screen().scroll_top, self.screen().scroll_bottom)
+        } else {
+            (0, self.rows() - 1)
+        }
     }
 
     fn enter_alternate_screen(&mut self, clear: bool) {

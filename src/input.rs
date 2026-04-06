@@ -1,8 +1,8 @@
 use objc2_app_kit::{
-    NSDeleteFunctionKey, NSDownArrowFunctionKey, NSEndFunctionKey, NSF10FunctionKey,
-    NSF11FunctionKey, NSF12FunctionKey, NSF1FunctionKey, NSF2FunctionKey, NSF3FunctionKey,
-    NSF4FunctionKey, NSF5FunctionKey, NSF6FunctionKey, NSF7FunctionKey, NSF8FunctionKey,
-    NSF9FunctionKey, NSHomeFunctionKey, NSLeftArrowFunctionKey, NSPageDownFunctionKey,
+    NSDeleteFunctionKey, NSDownArrowFunctionKey, NSEndFunctionKey, NSF1FunctionKey,
+    NSF2FunctionKey, NSF3FunctionKey, NSF4FunctionKey, NSF5FunctionKey, NSF6FunctionKey,
+    NSF7FunctionKey, NSF8FunctionKey, NSF9FunctionKey, NSF10FunctionKey, NSF11FunctionKey,
+    NSF12FunctionKey, NSHomeFunctionKey, NSLeftArrowFunctionKey, NSPageDownFunctionKey,
     NSPageUpFunctionKey, NSRightArrowFunctionKey, NSUpArrowFunctionKey,
 };
 
@@ -36,6 +36,20 @@ pub fn encode_paste(text: &str, bracketed: bool) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpecialKey {
+    ArrowUp,
+    ArrowDown,
+    ArrowRight,
+    ArrowLeft,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Delete,
+    F(u8),
+}
+
 pub fn translate_terminal_input(
     text: &str,
     modifiers: InputModifiers,
@@ -47,52 +61,8 @@ pub fn translate_terminal_input(
 
     if text.chars().count() == 1 {
         let ch = text.chars().next().unwrap_or_default() as u32;
-        let sequence = match ch {
-            value if value == NSUpArrowFunctionKey => Some(if application_cursor {
-                b"\x1bOA".to_vec()
-            } else {
-                b"\x1b[A".to_vec()
-            }),
-            value if value == NSDownArrowFunctionKey => Some(if application_cursor {
-                b"\x1bOB".to_vec()
-            } else {
-                b"\x1b[B".to_vec()
-            }),
-            value if value == NSRightArrowFunctionKey => Some(if application_cursor {
-                b"\x1bOC".to_vec()
-            } else {
-                b"\x1b[C".to_vec()
-            }),
-            value if value == NSLeftArrowFunctionKey => Some(if application_cursor {
-                b"\x1bOD".to_vec()
-            } else {
-                b"\x1b[D".to_vec()
-            }),
-            value if value == NSHomeFunctionKey => Some(if application_cursor {
-                b"\x1bOH".to_vec()
-            } else {
-                b"\x1b[H".to_vec()
-            }),
-            value if value == NSEndFunctionKey => Some(if application_cursor {
-                b"\x1bOF".to_vec()
-            } else {
-                b"\x1b[F".to_vec()
-            }),
-            value if value == NSPageUpFunctionKey => Some(b"\x1b[5~".to_vec()),
-            value if value == NSPageDownFunctionKey => Some(b"\x1b[6~".to_vec()),
-            value if value == NSDeleteFunctionKey => Some(b"\x1b[3~".to_vec()),
-            value if value == NSF1FunctionKey => Some(b"\x1bOP".to_vec()),
-            value if value == NSF2FunctionKey => Some(b"\x1bOQ".to_vec()),
-            value if value == NSF3FunctionKey => Some(b"\x1bOR".to_vec()),
-            value if value == NSF4FunctionKey => Some(b"\x1bOS".to_vec()),
-            value if value == NSF5FunctionKey => Some(b"\x1b[15~".to_vec()),
-            value if value == NSF6FunctionKey => Some(b"\x1b[17~".to_vec()),
-            value if value == NSF7FunctionKey => Some(b"\x1b[18~".to_vec()),
-            value if value == NSF8FunctionKey => Some(b"\x1b[19~".to_vec()),
-            value if value == NSF9FunctionKey => Some(b"\x1b[20~".to_vec()),
-            value if value == NSF10FunctionKey => Some(b"\x1b[21~".to_vec()),
-            value if value == NSF11FunctionKey => Some(b"\x1b[23~".to_vec()),
-            value if value == NSF12FunctionKey => Some(b"\x1b[24~".to_vec()),
+        let sequence = match special_key(ch) {
+            Some(key) => Some(encode_special_key(key, modifiers, application_cursor)),
             _ => None,
         };
         if sequence.is_some() {
@@ -102,6 +72,102 @@ pub fn translate_terminal_input(
 
     let _ = modifiers;
     Some(text.as_bytes().to_vec())
+}
+
+fn special_key(ch: u32) -> Option<SpecialKey> {
+    match ch {
+        value if value == NSUpArrowFunctionKey => Some(SpecialKey::ArrowUp),
+        value if value == NSDownArrowFunctionKey => Some(SpecialKey::ArrowDown),
+        value if value == NSRightArrowFunctionKey => Some(SpecialKey::ArrowRight),
+        value if value == NSLeftArrowFunctionKey => Some(SpecialKey::ArrowLeft),
+        value if value == NSHomeFunctionKey => Some(SpecialKey::Home),
+        value if value == NSEndFunctionKey => Some(SpecialKey::End),
+        value if value == NSPageUpFunctionKey => Some(SpecialKey::PageUp),
+        value if value == NSPageDownFunctionKey => Some(SpecialKey::PageDown),
+        value if value == NSDeleteFunctionKey => Some(SpecialKey::Delete),
+        value if value == NSF1FunctionKey => Some(SpecialKey::F(1)),
+        value if value == NSF2FunctionKey => Some(SpecialKey::F(2)),
+        value if value == NSF3FunctionKey => Some(SpecialKey::F(3)),
+        value if value == NSF4FunctionKey => Some(SpecialKey::F(4)),
+        value if value == NSF5FunctionKey => Some(SpecialKey::F(5)),
+        value if value == NSF6FunctionKey => Some(SpecialKey::F(6)),
+        value if value == NSF7FunctionKey => Some(SpecialKey::F(7)),
+        value if value == NSF8FunctionKey => Some(SpecialKey::F(8)),
+        value if value == NSF9FunctionKey => Some(SpecialKey::F(9)),
+        value if value == NSF10FunctionKey => Some(SpecialKey::F(10)),
+        value if value == NSF11FunctionKey => Some(SpecialKey::F(11)),
+        value if value == NSF12FunctionKey => Some(SpecialKey::F(12)),
+        _ => None,
+    }
+}
+
+fn encode_special_key(
+    key: SpecialKey,
+    modifiers: InputModifiers,
+    application_cursor: bool,
+) -> Vec<u8> {
+    let modifier = modifier_parameter(modifiers);
+    match key {
+        SpecialKey::ArrowUp => encode_cursor_key(b'A', modifier, application_cursor),
+        SpecialKey::ArrowDown => encode_cursor_key(b'B', modifier, application_cursor),
+        SpecialKey::ArrowRight => encode_cursor_key(b'C', modifier, application_cursor),
+        SpecialKey::ArrowLeft => encode_cursor_key(b'D', modifier, application_cursor),
+        SpecialKey::Home => encode_cursor_key(b'H', modifier, application_cursor),
+        SpecialKey::End => encode_cursor_key(b'F', modifier, application_cursor),
+        SpecialKey::PageUp => encode_tilde_key(5, modifier),
+        SpecialKey::PageDown => encode_tilde_key(6, modifier),
+        SpecialKey::Delete => encode_tilde_key(3, modifier),
+        SpecialKey::F(1) => encode_function_key_ss3(b'P', modifier),
+        SpecialKey::F(2) => encode_function_key_ss3(b'Q', modifier),
+        SpecialKey::F(3) => encode_function_key_ss3(b'R', modifier),
+        SpecialKey::F(4) => encode_function_key_ss3(b'S', modifier),
+        SpecialKey::F(5) => encode_tilde_key(15, modifier),
+        SpecialKey::F(6) => encode_tilde_key(17, modifier),
+        SpecialKey::F(7) => encode_tilde_key(18, modifier),
+        SpecialKey::F(8) => encode_tilde_key(19, modifier),
+        SpecialKey::F(9) => encode_tilde_key(20, modifier),
+        SpecialKey::F(10) => encode_tilde_key(21, modifier),
+        SpecialKey::F(11) => encode_tilde_key(23, modifier),
+        SpecialKey::F(12) => encode_tilde_key(24, modifier),
+        SpecialKey::F(_) => Vec::new(),
+    }
+}
+
+fn modifier_parameter(modifiers: InputModifiers) -> Option<u8> {
+    let mut value = 1;
+    if modifiers.shift {
+        value += 1;
+    }
+    if modifiers.option {
+        value += 2;
+    }
+    if modifiers.control {
+        value += 4;
+    }
+
+    if value == 1 { None } else { Some(value) }
+}
+
+fn encode_cursor_key(final_byte: u8, modifier: Option<u8>, application_cursor: bool) -> Vec<u8> {
+    match modifier {
+        Some(modifier) => format!("\x1b[1;{modifier}{}", final_byte as char).into_bytes(),
+        None if application_cursor => vec![0x1b, b'O', final_byte],
+        None => vec![0x1b, b'[', final_byte],
+    }
+}
+
+fn encode_function_key_ss3(final_byte: u8, modifier: Option<u8>) -> Vec<u8> {
+    match modifier {
+        Some(modifier) => format!("\x1b[1;{modifier}{}", final_byte as char).into_bytes(),
+        None => vec![0x1b, b'O', final_byte],
+    }
+}
+
+fn encode_tilde_key(code: u8, modifier: Option<u8>) -> Vec<u8> {
+    match modifier {
+        Some(modifier) => format!("\x1b[{code};{modifier}~").into_bytes(),
+        None => format!("\x1b[{code}~").into_bytes(),
+    }
 }
 
 pub fn reduce_selection_phase(
@@ -177,7 +243,10 @@ mod tests {
             translate_terminal_input("abc", InputModifiers::default(), false),
             Some(b"abc".to_vec())
         );
-        assert_eq!(translate_terminal_input("", InputModifiers::default(), false), None);
+        assert_eq!(
+            translate_terminal_input("", InputModifiers::default(), false),
+            None
+        );
     }
 
     #[test]
@@ -235,6 +304,68 @@ mod tests {
         assert_eq!(
             translate_terminal_input("\u{f72b}", InputModifiers::default(), true),
             Some(b"\x1bOF".to_vec())
+        );
+    }
+
+    #[test]
+    fn modifiers_expand_special_key_escape_sequences() {
+        assert_eq!(
+            translate_terminal_input(
+                "\u{f700}",
+                InputModifiers {
+                    shift: true,
+                    ..InputModifiers::default()
+                },
+                false
+            ),
+            Some(b"\x1b[1;2A".to_vec())
+        );
+        assert_eq!(
+            translate_terminal_input(
+                "\u{f729}",
+                InputModifiers {
+                    control: true,
+                    ..InputModifiers::default()
+                },
+                true
+            ),
+            Some(b"\x1b[1;5H".to_vec())
+        );
+        assert_eq!(
+            translate_terminal_input(
+                "\u{f728}",
+                InputModifiers {
+                    option: true,
+                    ..InputModifiers::default()
+                },
+                false
+            ),
+            Some(b"\x1b[3;3~".to_vec())
+        );
+        assert_eq!(
+            translate_terminal_input(
+                "\u{f704}",
+                InputModifiers {
+                    shift: true,
+                    control: true,
+                    ..InputModifiers::default()
+                },
+                false
+            ),
+            Some(b"\x1b[1;6P".to_vec())
+        );
+        assert_eq!(
+            translate_terminal_input(
+                "\u{f70f}",
+                InputModifiers {
+                    shift: true,
+                    option: true,
+                    control: true,
+                    ..InputModifiers::default()
+                },
+                false
+            ),
+            Some(b"\x1b[24;8~".to_vec())
         );
     }
 }

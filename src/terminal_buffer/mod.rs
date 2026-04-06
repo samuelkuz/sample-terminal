@@ -468,4 +468,80 @@ mod tests {
         assert!(!buffer.modes().application_cursor);
         assert!(!buffer.modes().origin_mode);
     }
+
+    #[test]
+    fn origin_mode_makes_cursor_addressing_relative_to_scroll_region() {
+        let mut buffer = TerminalBuffer::new(4, 5);
+        buffer.push_bytes(b"\x1b[2;4r\x1b[?6h\x1b[1;1H@\x1b[3;2H#\x1b[1d!");
+
+        assert_eq!(
+            lines(&mut buffer),
+            vec![
+                "    ".to_string(),
+                "@ ! ".to_string(),
+                "    ".to_string(),
+                " #  ".to_string(),
+                "    ".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn absolute_cursor_addressing_ignores_scroll_region_when_origin_mode_is_disabled() {
+        let mut buffer = TerminalBuffer::new(4, 5);
+        buffer.push_bytes(b"\x1b[2;4r\x1b[1;1H@\x1b[3;2H#");
+
+        assert_eq!(
+            lines(&mut buffer),
+            vec![
+                "@   ".to_string(),
+                "    ".to_string(),
+                " #  ".to_string(),
+                "    ".to_string(),
+                "    ".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn origin_mode_moves_cursor_to_region_home_on_toggle_and_scroll_region_reset() {
+        let mut buffer = TerminalBuffer::new(4, 5);
+        buffer.push_bytes(b"\x1b[3;5r\x1b[?6h");
+
+        assert_eq!(
+            buffer.render_snapshot(true).cursor,
+            Some(CursorState {
+                row: 2,
+                col: 0,
+                visible: true,
+            })
+        );
+
+        buffer.push_bytes(b"\x1b[?6l");
+        assert_eq!(
+            buffer.render_snapshot(true).cursor,
+            Some(CursorState {
+                row: 0,
+                col: 0,
+                visible: true,
+            })
+        );
+    }
+
+    #[test]
+    fn origin_mode_clamps_relative_cursor_moves_to_scroll_region() {
+        let mut buffer = TerminalBuffer::new(4, 5);
+        buffer.push_bytes(b"\x1b[2;4r\x1b[?6h\x1b[1;1H\x1b[10B*");
+
+        assert_eq!(
+            lines(&mut buffer),
+            vec![
+                "    ".to_string(),
+                "    ".to_string(),
+                "    ".to_string(),
+                "*   ".to_string(),
+                "    ".to_string()
+            ]
+        );
+    }
 }

@@ -3,8 +3,8 @@ const OUTER_PADDING_Y: f64 = 24.0;
 const HEADER_HEIGHT: f64 = 36.0;
 const GRID_PADDING_X: f64 = 18.0;
 const GRID_PADDING_Y: f64 = 18.0;
-pub(crate) const CELL_WIDTH: f64 = 16.0;
-pub(crate) const CELL_HEIGHT: f64 = 24.0;
+pub(crate) const CELL_WIDTH: f64 = 12.0;
+pub(crate) const CELL_HEIGHT: f64 = 20.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LayoutMetrics {
@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn grid_size_scales_with_viewport() {
-        assert_eq!(terminal_grid_size(900.0, 640.0), (50, 21));
+        assert_eq!(terminal_grid_size(900.0, 640.0), (67, 26));
     }
 
     #[test]

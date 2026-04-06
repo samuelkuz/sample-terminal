@@ -268,11 +268,14 @@ pub(crate) fn build_row_geometry(
         if cell.ch != ' ' {
             let glyph = atlas.glyph_for(cell.ch);
             if glyph.bitmap_size[0] > 0.0 && glyph.bitmap_size[1] > 0.0 {
+                let origin_x =
+                    (metrics.content_x + (col as f32 * metrics.cell_width) + glyph.offset[0])
+                        .round();
+                let origin_y =
+                    (metrics.content_y + (row as f32 * metrics.cell_height) + glyph.offset[1])
+                        .round();
                 geometry.text_instances.push(TextInstance {
-                    origin: [
-                        metrics.content_x + (col as f32 * metrics.cell_width) + glyph.offset[0],
-                        metrics.content_y + (row as f32 * metrics.cell_height) + glyph.offset[1],
-                    ],
+                    origin: [origin_x, origin_y],
                     size: glyph.bitmap_size,
                     uv_origin: glyph.uv_origin,
                     uv_size: glyph.uv_size,

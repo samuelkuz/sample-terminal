@@ -490,8 +490,8 @@ fn build_text_sampler(
     device: &ProtocolObject<dyn MTLDevice>,
 ) -> Result<Retained<ProtocolObject<dyn MTLSamplerState>>, String> {
     let descriptor = MTLSamplerDescriptor::new();
-    descriptor.setMinFilter(MTLSamplerMinMagFilter::Linear);
-    descriptor.setMagFilter(MTLSamplerMinMagFilter::Linear);
+    descriptor.setMinFilter(MTLSamplerMinMagFilter::Nearest);
+    descriptor.setMagFilter(MTLSamplerMinMagFilter::Nearest);
     descriptor.setSAddressMode(MTLSamplerAddressMode::ClampToEdge);
     descriptor.setTAddressMode(MTLSamplerAddressMode::ClampToEdge);
     descriptor.setRAddressMode(MTLSamplerAddressMode::ClampToEdge);

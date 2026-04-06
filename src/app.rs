@@ -13,8 +13,7 @@ use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTi
 
 use crate::app_state::AppState;
 use crate::input::{
-    InputModifiers, SelectionPhase, encode_paste, normalize_scroll_lines,
-    translate_terminal_input,
+    InputModifiers, SelectionPhase, encode_paste, normalize_scroll_lines, translate_terminal_input,
 };
 use crate::layout::{point_to_cell, terminal_grid_size};
 use crate::renderer::{RenderFrameInput, TerminalRenderer};
@@ -303,10 +302,12 @@ fn is_command_v(event: &NSEvent) -> bool {
         return false;
     }
 
-    event.charactersIgnoringModifiers().is_some_and(|characters| {
-        let text = characters.to_string();
-        text.eq_ignore_ascii_case("v")
-    })
+    event
+        .charactersIgnoringModifiers()
+        .is_some_and(|characters| {
+            let text = characters.to_string();
+            text.eq_ignore_ascii_case("v")
+        })
 }
 
 fn paste_impl() {
@@ -316,8 +317,9 @@ fn paste_impl() {
         return;
     };
 
-    let paste = with_app_state(|state| encode_paste(&text.to_string(), state.bracketed_paste_enabled()))
-        .flatten();
+    let paste =
+        with_app_state(|state| encode_paste(&text.to_string(), state.bracketed_paste_enabled()))
+            .flatten();
     if let Some(bytes) = paste {
         let _ = with_app_state(|state| state.send_input(&bytes));
     }

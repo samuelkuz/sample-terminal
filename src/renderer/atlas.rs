@@ -15,10 +15,10 @@ use objc2_metal::{
 
 const ATLAS_WIDTH: usize = 512;
 const ATLAS_PADDING: usize = 1;
-const CELL_WIDTH: f32 = 16.0;
-const CELL_HEIGHT: f32 = 24.0;
+const CELL_WIDTH: f32 = 12.0;
+const CELL_HEIGHT: f32 = 20.0;
 const FONT_NAME: &str = "Menlo";
-const FONT_SIZE: f64 = 18.0;
+const FONT_SIZE: f64 = 15.0;
 const FALLBACK_CHAR: char = '?';
 
 #[derive(Clone, Copy, Debug, PartialEq)]
